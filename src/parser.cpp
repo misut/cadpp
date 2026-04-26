@@ -87,6 +87,28 @@ void extract(Dwg_Object const* obj, Entities& out) {
             ++out.arc_count;
             break;
         }
+        case DWG_TYPE_TEXT: {
+            auto const* t = obj->tio.entity->tio.TEXT;
+            if (!t || !t->text_value) { ++out.unknown_entities; break; }
+            out.texts.push_back(Text{
+                Point{t->ins_pt.x, t->ins_pt.y},
+                t->height,
+                std::string(t->text_value),
+            });
+            ++out.text_count;
+            break;
+        }
+        case DWG_TYPE_MTEXT: {
+            auto const* m = obj->tio.entity->tio.MTEXT;
+            if (!m || !m->text) { ++out.unknown_entities; break; }
+            out.texts.push_back(Text{
+                Point{m->ins_pt.x, m->ins_pt.y},
+                m->text_height,
+                std::string(m->text),
+            });
+            ++out.text_count;
+            break;
+        }
         case DWG_TYPE_LWPOLYLINE: {
             auto const* p = obj->tio.entity->tio.LWPOLYLINE;
             if (!p || !p->points || p->num_points < 2) {

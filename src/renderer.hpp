@@ -14,4 +14,8 @@ void render_lines(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform);
 
+void render_texts(phenotype::Painter& p,
+                  Entities const& entities,
+                  ViewportTransform const& transform);
+
 } // namespace cadpp

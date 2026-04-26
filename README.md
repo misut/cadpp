@@ -10,12 +10,12 @@ contain `+`. The product, binary, and window title are `cad++`.
 
 ## Status
 
-**Pre-alpha — M4 circles, arcs, polylines.** Opens a window that
-loads a hardcoded sample DWG via LibreDWG, extracts `LINE` /
-`CIRCLE` / `ARC` / `LWPOLYLINE` entities, tessellates curves into
-chord segments at parse time (~64 per full revolution), and renders
-the whole thing through phenotype's `widget::canvas` immediate-mode
-painter.
+**Pre-alpha — M5 text entities.** Opens a window that loads a
+hardcoded sample DWG via LibreDWG, extracts `LINE` / `CIRCLE` /
+`ARC` / `LWPOLYLINE` / `TEXT` / `MTEXT` entities, tessellates
+curves into chord segments at parse time, and renders the whole
+thing (lines + text) through phenotype's `widget::canvas`
+immediate-mode painter.
 
 Roadmap (v0.1.0):
 
@@ -23,7 +23,8 @@ Roadmap (v0.1.0):
 - M2 — LibreDWG parse-only smoke test ✅
 - M3 — minimal renderer (lines) ✅
 - M4 — circles, arcs, polylines (segment decomposition) ✅
-- M5 — text entities
+- M5 — text entities ✅
+- M6 — Android port + file picker on both platforms
 - M4 — circles, arcs, polylines (segment decomposition)
 - M5 — text entities
 - M6 — Android port + file picker on both platforms

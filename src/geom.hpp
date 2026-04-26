@@ -39,6 +39,10 @@ inline BBox compute_bbox(Entities const& e) {
         b.add(l.a.x, l.a.y);
         b.add(l.b.x, l.b.y);
     }
+    for (auto const& t : e.texts) {
+        b.add(t.position.x, t.position.y);
+        b.add(t.position.x, t.position.y + t.height);
+    }
     return b;
 }
 
