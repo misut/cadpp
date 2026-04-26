@@ -10,13 +10,14 @@ contain `+`. The product, binary, and window title are `cad++`.
 
 ## Status
 
-**Pre-alpha — M1 bootstrap.** Opens a placeholder window. File picker
-and entity rendering arrive in subsequent milestones.
+**Pre-alpha — M2 parser smoke test.** Opens a window that loads a
+hardcoded sample DWG via LibreDWG and shows the entity-type
+breakdown (lines, circles, arcs, polylines, text, other).
 
 Roadmap (v0.1.0):
 
-- M1 — repository bootstrap (this milestone)
-- M2 — LibreDWG parse-only smoke test
+- M1 — repository bootstrap ✅
+- M2 — LibreDWG parse-only smoke test ✅
 - M3 — minimal renderer (lines)
 - M4 — circles, arcs, polylines (segment decomposition)
 - M5 — text entities

@@ -15,6 +15,38 @@ cmake-in-root = false
 [target.'cfg(os = "macos")'.build]
 ldflags = ["-framework", "Security", "-Wl,-framework,CoreFoundation"]
 
+[target.'cfg(os = "macos")'.dependencies.cmake.libredwg]
+git = "https://github.com/LibreDWG/libredwg.git"
+tag = "0.13.4"
+targets = "redwg"
+
+[target.'cfg(os = "macos")'.dependencies.cmake.libredwg.options]
+LIBREDWG_LIBONLY = "ON"
+LIBREDWG_DISABLE_WRITE = "ON"
+LIBREDWG_DISABLE_JSON = "ON"
+DISABLE_WERROR = "ON"
+BUILD_SHARED_LIBS = "OFF"
+ENABLE_LTO = "OFF"
+# memmem on macOS is a non-POSIX extension hidden behind
+# _DARWIN_C_SOURCE; LibreDWG's decode.c uses it unconditionally.
+# Without this, clang 16+ errors on the implicit declaration.
+# (exon turns space-separated CMAKE_C_FLAGS into a `;`-separated cmake
+# list; pass the single critical flag here.)
+CMAKE_C_FLAGS = "-D_DARWIN_C_SOURCE"
+
+[target.'cfg(os = "windows")'.dependencies.cmake.libredwg]
+git = "https://github.com/LibreDWG/libredwg.git"
+tag = "0.13.4"
+targets = "libredwg"
+
+[target.'cfg(os = "windows")'.dependencies.cmake.libredwg.options]
+LIBREDWG_LIBONLY = "ON"
+LIBREDWG_DISABLE_WRITE = "ON"
+LIBREDWG_DISABLE_JSON = "ON"
+DISABLE_WERROR = "ON"
+BUILD_SHARED_LIBS = "OFF"
+ENABLE_LTO = "OFF"
+
 [dependencies]
 "github.com/misut/cppx" = "1.9.0"
 
