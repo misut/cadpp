@@ -1,0 +1,65 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# debug information files
+*.dwo
+
+# IDE
+.vscode/
+
+# Build
+build/
+.exon/
+exon.lock
+!/exon.lock
+!/docs/exon.lock
+/examples/*/exon.lock
+/libs/*/exon.lock
+/tools/*/exon.lock
+
+*.wasm
+
+# docs build outputs (built by CI)
+docs/phenotype.js
+
+# Claude Code
+CLAUDE.md
+
+# Local mise env overrides (e.g. ANDROID_NDK_HOME for the android target)
+.mise/
