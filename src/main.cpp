@@ -3,9 +3,12 @@
 //
 // Copyright (C) 2026 misut
 //
-// M3 — opens a hardcoded sample DWG via LibreDWG, fits its line
-// entities into a fixed canvas, and renders them through the new
-// widget::canvas / Painter primitive that landed in phenotype #194.
+// M4 — extends M3 to also extract CIRCLE / ARC / LWPOLYLINE entities
+// from the sample DWG. CIRCLE and ARC are tessellated into chord
+// segments (~64 per full revolution); LWPOLYLINE just walks adjacent
+// vertices. Everything still flows through the M3 widget::canvas /
+// Painter::line pipeline — the renderer doesn't need to know about
+// curves, only segments.
 
 import std;
 import phenotype;
@@ -26,7 +29,12 @@ std::string format_summary(cadpp::Entities const& e) {
     }
     std::string out;
     out  = "Format: " + e.version + "\n";
-    out += "Lines: " + std::to_string(e.lines.size()) + "\n";
+    out += "Source entities: "
+           + std::to_string(e.line_count)     + " line(s), "
+           + std::to_string(e.circle_count)   + " circle(s), "
+           + std::to_string(e.arc_count)      + " arc(s), "
+           + std::to_string(e.polyline_count) + " polyline(s)\n";
+    out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";
     out += "Other entities (skipped): " + std::to_string(e.unknown_entities);
     return out;
 }
@@ -58,7 +66,7 @@ void view(State const& state) {
     layout::padded(SpaceToken::Lg, [&] {
         layout::column([&] {
             widget::text("cad++", TextSize::Heading);
-            widget::text("M3 — line rendering via widget::canvas",
+            widget::text("M4 — circles, arcs, polylines via segment tessellation",
                          TextSize::Small, TextColor::Muted);
             widget::text("Sample: test/fixtures/sample_2000.dwg",
                          TextSize::Small, TextColor::Muted);

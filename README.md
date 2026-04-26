@@ -10,17 +10,20 @@ contain `+`. The product, binary, and window title are `cad++`.
 
 ## Status
 
-**Pre-alpha — M3 line renderer.** Opens a window that loads a
-hardcoded sample DWG via LibreDWG, fits its `LINE` entities into a
-fixed canvas (CAD Y-up → screen Y-down), and renders them through
-phenotype's new `widget::canvas` immediate-mode painter.
+**Pre-alpha — M4 circles, arcs, polylines.** Opens a window that
+loads a hardcoded sample DWG via LibreDWG, extracts `LINE` /
+`CIRCLE` / `ARC` / `LWPOLYLINE` entities, tessellates curves into
+chord segments at parse time (~64 per full revolution), and renders
+the whole thing through phenotype's `widget::canvas` immediate-mode
+painter.
 
 Roadmap (v0.1.0):
 
 - M1 — repository bootstrap ✅
 - M2 — LibreDWG parse-only smoke test ✅
 - M3 — minimal renderer (lines) ✅
-- M4 — circles, arcs, polylines (segment decomposition)
+- M4 — circles, arcs, polylines (segment decomposition) ✅
+- M5 — text entities
 - M4 — circles, arcs, polylines (segment decomposition)
 - M5 — text entities
 - M6 — Android port + file picker on both platforms
