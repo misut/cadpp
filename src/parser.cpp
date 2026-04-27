@@ -98,6 +98,65 @@ EntityMetadata resolve_entity_metadata(Dwg_Object_Entity const* ent) {
     return out;
 }
 
+// De Boor evaluation of a non-rational B-spline at parameter `t`.
+// `ctrl` is the control polygon, `knots` is the knot vector
+// (length == ctrl.size() + degree + 1 for a clamped uniform spline).
+// Out-of-range knot indices clamp to the vector edges so the
+// evaluator stays robust at the boundary parameters
+// `t = knots[degree]` and `t = knots[ctrl.size()]`.
+//
+// Rational (weighted) splines are evaluated as if w == 1. Real CAD
+// splines are almost always non-rational; rational support can land
+// in a follow-up once a fixture demonstrates the gap.
+Point de_boor(double t,
+              std::vector<Point> const& ctrl,
+              std::vector<double> const& knots,
+              int degree) {
+    int const n = static_cast<int>(ctrl.size());
+    if (n <= 0) return Point{};
+    if (degree <= 0) {
+        int idx = static_cast<int>(t);
+        if (idx < 0) idx = 0;
+        if (idx >= n) idx = n - 1;
+        return ctrl[idx];
+    }
+
+    // Find span k such that knots[k] <= t < knots[k+1]. Linear walk
+    // is fine — for typical CAD splines (≤ 50 control points) the
+    // cost is dominated by the De Boor recursion below.
+    int const last_knot = static_cast<int>(knots.size()) - 1;
+    int k = degree;
+    while (k < last_knot && knots[k + 1] <= t) ++k;
+    if (k >= n) k = n - 1;
+
+    auto knot_at = [&](int idx) -> double {
+        if (idx < 0) return knots.front();
+        if (idx > last_knot) return knots[last_knot];
+        return knots[idx];
+    };
+    auto ctrl_at = [&](int idx) -> Point {
+        if (idx < 0) return ctrl.front();
+        if (idx >= n) return ctrl[n - 1];
+        return ctrl[idx];
+    };
+
+    std::vector<Point> d(degree + 1);
+    for (int j = 0; j <= degree; ++j) {
+        d[j] = ctrl_at(k - degree + j);
+    }
+    for (int r = 1; r <= degree; ++r) {
+        for (int j = degree; j >= r; --j) {
+            double const left  = knot_at(k - degree + j);
+            double const right = knot_at(k + 1 + j - r);
+            double const denom = right - left;
+            double const alpha = denom > 1e-12 ? (t - left) / denom : 0.0;
+            d[j].x = (1.0 - alpha) * d[j - 1].x + alpha * d[j].x;
+            d[j].y = (1.0 - alpha) * d[j - 1].y + alpha * d[j].y;
+        }
+    }
+    return d[degree];
+}
+
 char const* version_string(unsigned int v) {
     switch (static_cast<int>(v)) {
         case R_13:    return "AC1012 (R13)";
@@ -293,6 +352,86 @@ void extract(Dwg_Object const* obj, Entities& out) {
                 std::move(meta.layer_name),
             });
             ++out.ellipse_count;
+            break;
+        }
+        case DWG_TYPE_SPLINE: {
+            auto const* s = obj->tio.entity->tio.SPLINE;
+            if (!s) { ++out.unknown_entities; break; }
+            auto meta = resolve_entity_metadata(obj->tio.entity);
+            Spline sp{};
+            sp.color      = meta.color;
+            sp.layer_name = std::move(meta.layer_name);
+            // Bit 0 of legacy flag, plus bit 2 of the 2013+ splineflags.
+            sp.closed = (s->closed_b != 0)
+                        || ((s->splineflags & 0x4) != 0);
+
+            int const degree = s->degree > 0
+                ? static_cast<int>(s->degree) : 3;
+
+            // Bezier scenario / files that ship interpolation points
+            // (often alongside ctrl_pts) — connect the fit points
+            // verbatim. Parser-side fidelity is bounded by what the
+            // editor wrote, but it's exactly what the file says the
+            // curve passes through.
+            bool const have_fit_pts =
+                (s->scenario == SPLINE_SCENARIO_BEZIER
+                 || s->num_fit_pts > 1)
+                && s->fit_pts != nullptr;
+
+            if (have_fit_pts) {
+                sp.points.reserve(s->num_fit_pts);
+                for (BITCODE_BS i = 0; i < s->num_fit_pts; ++i) {
+                    sp.points.push_back(
+                        Point{s->fit_pts[i].x, s->fit_pts[i].y});
+                }
+            } else if (s->num_ctrl_pts > 0 && s->ctrl_pts != nullptr
+                       && s->num_knots >= static_cast<BITCODE_BL>(
+                              s->num_ctrl_pts + degree + 1)
+                       && s->knots != nullptr) {
+                // De Boor sample at uniform parameter steps. The 8-per-
+                // ctrl-pt heuristic (floored at 64) gives smooth output
+                // for typical CAD splines without going overboard on
+                // long control polygons.
+                std::vector<Point> ctrl;
+                ctrl.reserve(s->num_ctrl_pts);
+                for (BITCODE_BL i = 0; i < s->num_ctrl_pts; ++i) {
+                    ctrl.push_back(Point{
+                        s->ctrl_pts[i].x, s->ctrl_pts[i].y,
+                    });
+                }
+                std::vector<double> knots;
+                knots.reserve(s->num_knots);
+                for (BITCODE_BL i = 0; i < s->num_knots; ++i) {
+                    knots.push_back(s->knots[i]);
+                }
+
+                double const t_min = knots[degree];
+                double const t_max = knots[s->num_ctrl_pts];
+                if (t_max > t_min) {
+                    int const samples = std::max<int>(
+                        64, static_cast<int>(s->num_ctrl_pts) * 8);
+                    sp.points.reserve(samples + 1);
+                    for (int i = 0; i <= samples; ++i) {
+                        double t = t_min
+                            + (t_max - t_min)
+                                * static_cast<double>(i)
+                                / static_cast<double>(samples);
+                        // Nudge the right boundary inside the last
+                        // knot span so the De Boor span search can't
+                        // overshoot.
+                        if (i == samples) t = t_max - 1e-9;
+                        sp.points.push_back(
+                            de_boor(t, ctrl, knots, degree));
+                    }
+                }
+            }
+
+            if (sp.points.size() >= 2) {
+                out.splines.push_back(std::move(sp));
+                ++out.spline_count;
+            } else {
+                ++out.unknown_entities;
+            }
             break;
         }
         default:
