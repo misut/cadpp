@@ -16,6 +16,46 @@ constexpr int    kCircleSegments = 64;
 constexpr double kPi             = 3.14159265358979323846;
 constexpr double kTwoPi          = 2.0 * kPi;
 
+// LibreDWG color-method codes (Dwg_Color_Method in include/dwg.h).
+// Reproduced as integer constants here so we don't have to expose the
+// LibreDWG enum through the parser facade.
+constexpr int kColorMethodAci       = 0xc2;
+constexpr int kColorMethodTruecolor = 0xc3;
+
+// Translate a LibreDWG entity color into cad++'s RGBA. Returns the
+// default ink (Color{}) for BYLAYER / BYBLOCK / unknown methods —
+// cad++ has no layer model yet (Slab 4), so any layer-relative color
+// stays indistinguishable from the legacy flat-ink rendering.
+//
+// AutoCAD's ACI 7 ("white-on-dark, black-on-light") gets the same
+// fall-back: rendering ACI-7 lines as white on cad++'s light canvas
+// would make them invisible. Matches what every CAD viewer ships.
+Color resolve_color(Dwg_Object_Entity const* ent) {
+    if (ent == nullptr) return Color{};
+    auto const& c = ent->color;
+    int const method = static_cast<int>(c.method);
+    if (method == kColorMethodTruecolor) {
+        std::uint32_t const rgb = static_cast<std::uint32_t>(c.rgb);
+        return Color{
+            static_cast<std::uint8_t>((rgb >> 16) & 0xff),
+            static_cast<std::uint8_t>((rgb >>  8) & 0xff),
+            static_cast<std::uint8_t>( rgb        & 0xff),
+            255,
+        };
+    }
+    int const idx = static_cast<int>(c.index);
+    if (method != kColorMethodAci || idx <= 0 || idx == 7 || idx >= 256) {
+        return Color{};
+    }
+    BITCODE_BL const packed = dwg_rgb_palette_index(static_cast<BITCODE_BS>(idx));
+    return Color{
+        static_cast<std::uint8_t>((packed >> 16) & 0xff),
+        static_cast<std::uint8_t>((packed >>  8) & 0xff),
+        static_cast<std::uint8_t>( packed        & 0xff),
+        255,
+    };
+}
+
 char const* version_string(unsigned int v) {
     switch (static_cast<int>(v)) {
         case R_13:    return "AC1012 (R13)";
@@ -35,7 +75,7 @@ char const* version_string(unsigned int v) {
 // per full revolution. Number of segments scales with the arc span
 // so a small arc gets a proportionally small number of chords.
 void tessellate_arc(Entities& out, double cx, double cy, double r,
-                    double start_angle, double end_angle) {
+                    double start_angle, double end_angle, Color color) {
     double span = end_angle - start_angle;
     if (span <= 0.0) span += kTwoPi;          // AutoCAD wraps modulo 2π
     if (span > kTwoPi) span = kTwoPi;
@@ -49,7 +89,7 @@ void tessellate_arc(Entities& out, double cx, double cy, double r,
                                        / static_cast<double>(n);
         double nx = cx + r * std::cos(t);
         double ny = cy + r * std::sin(t);
-        out.lines.push_back(Line{Point{prev_x, prev_y}, Point{nx, ny}});
+        out.lines.push_back(Line{Point{prev_x, prev_y}, Point{nx, ny}, color});
         prev_x = nx;
         prev_y = ny;
     }
@@ -64,9 +104,11 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_LINE: {
             auto const* line = obj->tio.entity->tio.LINE;
             if (!line) { ++out.unknown_entities; break; }
+            Color const color = resolve_color(obj->tio.entity);
             out.lines.push_back(Line{
                 Point{line->start.x, line->start.y},
                 Point{line->end.x,   line->end.y},
+                color,
             });
             ++out.line_count;
             break;
@@ -75,7 +117,7 @@ void extract(Dwg_Object const* obj, Entities& out) {
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
             tessellate_arc(out, c->center.x, c->center.y, c->radius,
-                           0.0, kTwoPi);
+                           0.0, kTwoPi, resolve_color(obj->tio.entity));
             ++out.circle_count;
             break;
         }
@@ -83,7 +125,8 @@ void extract(Dwg_Object const* obj, Entities& out) {
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
             tessellate_arc(out, a->center.x, a->center.y, a->radius,
-                           a->start_angle, a->end_angle);
+                           a->start_angle, a->end_angle,
+                           resolve_color(obj->tio.entity));
             ++out.arc_count;
             break;
         }
@@ -94,6 +137,7 @@ void extract(Dwg_Object const* obj, Entities& out) {
                 Point{t->ins_pt.x, t->ins_pt.y},
                 t->height,
                 std::string(t->text_value),
+                resolve_color(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -105,6 +149,7 @@ void extract(Dwg_Object const* obj, Entities& out) {
                 Point{m->ins_pt.x, m->ins_pt.y},
                 m->text_height,
                 std::string(m->text),
+                resolve_color(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -114,18 +159,19 @@ void extract(Dwg_Object const* obj, Entities& out) {
             if (!p || !p->points || p->num_points < 2) {
                 ++out.unknown_entities; break;
             }
+            Color const color = resolve_color(obj->tio.entity);
             auto const npts = p->num_points;
             for (BITCODE_BL i = 1; i < npts; ++i) {
                 auto const& a = p->points[i - 1];
                 auto const& b = p->points[i];
-                out.lines.push_back(Line{Point{a.x, a.y}, Point{b.x, b.y}});
+                out.lines.push_back(Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
             }
             // flag bit 0 (= LWPLINE_CLOSED) → close the loop with a
             // segment from the last vertex back to the first.
             if ((p->flag & 0x1) != 0) {
                 auto const& a = p->points[npts - 1];
                 auto const& b = p->points[0];
-                out.lines.push_back(Line{Point{a.x, a.y}, Point{b.x, b.y}});
+                out.lines.push_back(Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
             }
             ++out.polyline_count;
             // Bulged segments (`p->bulges`, signed-tangent arcs between
