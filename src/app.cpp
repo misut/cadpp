@@ -60,6 +60,9 @@ std::string format_summary(Entities const& e) {
            + std::to_string(e.ellipse_count)  + " ellipse(s), "
            + std::to_string(e.spline_count)   + " spline(s), "
            + std::to_string(e.text_count)     + " text(s)\n";
+    out += "Composite entities: "
+           + std::to_string(e.insert_count)    + " INSERT(s), "
+           + std::to_string(e.dimension_count) + " DIMENSION(s)\n";
     out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";
     out += "Other entities (skipped): " + std::to_string(e.unknown_entities);
     return out;
