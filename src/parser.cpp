@@ -101,6 +101,114 @@ EntityMetadata resolve_entity_metadata(Dwg_Object_Entity const* ent) {
     return out;
 }
 
+// Slab 7 — resolve an entity's effective linetype dash pattern.
+//
+// Tries the entity's own `ltype` handle first; if that's absent or
+// resolves outside the LTYPE table (BYLAYER / BYBLOCK / null) the
+// layer's stored linetype is used as the fallback. CONTINUOUS-named
+// linetypes and zero-dash patterns return empty so the caller can
+// fast-path solid LINEs through the existing emit.
+//
+// Returned vector is the raw signed dash pattern in world units —
+// positive = dash, negative = gap, zero = dot.
+std::vector<double> resolve_entity_dashes(
+        Dwg_Data* dwg, Dwg_Object_Entity const* ent) {
+    if (ent == nullptr) return {};
+
+    auto try_ltype_obj = [&](BITCODE_H ref) -> Dwg_Object_LTYPE const* {
+        if (ref == nullptr) return nullptr;
+        Dwg_Object* obj = dwg_ref_object(dwg, ref);
+        if (obj == nullptr
+            || obj->supertype != DWG_SUPERTYPE_OBJECT
+            || static_cast<int>(obj->fixedtype) != DWG_TYPE_LTYPE) {
+            return nullptr;
+        }
+        return obj->tio.object->tio.LTYPE;
+    };
+
+    Dwg_Object_LTYPE const* lt = try_ltype_obj(ent->ltype);
+    if (lt == nullptr) {
+        Dwg_Object_LAYER* layer = dwg_get_entity_layer(ent);
+        if (layer != nullptr) lt = try_ltype_obj(layer->ltype);
+    }
+    if (lt == nullptr || lt->numdashes == 0 || lt->dashes == nullptr) {
+        return {};
+    }
+    // CONTINUOUS / Continuous — explicit solid linetype with no dashes.
+    // BYLAYER / BYBLOCK names are sentinel pseudo-linetypes — leave
+    // the line solid here; entity-side `BYLAYER` already fell through
+    // to the layer's actual ltype above.
+    if (lt->name != nullptr) {
+        std::string_view const n = lt->name;
+        if (n == "Continuous" || n == "CONTINUOUS"
+            || n == "ByLayer" || n == "BYLAYER"
+            || n == "ByBlock" || n == "BYBLOCK") return {};
+    }
+
+    std::vector<double> dashes;
+    dashes.reserve(lt->numdashes);
+    for (BITCODE_RC i = 0; i < lt->numdashes; ++i) {
+        dashes.push_back(lt->dashes[i].length);
+    }
+    // Degenerate (all-zero) pattern would loop forever in the
+    // decomposer; treat it as solid.
+    double sum = 0.0;
+    for (double v : dashes) sum += std::abs(v);
+    if (sum < 1e-9) return {};
+    return dashes;
+}
+
+// Slab 7 — walk a straight LINE under the linetype's dash pattern,
+// emitting one `Line` record per dash interval. Gaps and dots are
+// skipped (dots could be rendered as tiny length-0 dashes; deferred
+// because they have no meaningful pixel size at typical zoom). The
+// affine `xf` (INSERT-composed transform) applies to each emitted
+// segment so dashes inherit any block scale / rotation.
+//
+// Pattern length lives in world units — same convention CAD uses —
+// so dashes zoom in / out with the drawing. At extreme zoom-out the
+// pattern can fall below 1 px and visually merge into a solid line;
+// that matches every CAD viewer.
+void decompose_dashed_line(Point a_world, Point b_world,
+                           std::vector<double> const& dashes,
+                           Affine const& xf,
+                           Color const& color,
+                           std::string const& layer_name,
+                           Entities& out) {
+    double const dx = b_world.x - a_world.x;
+    double const dy = b_world.y - a_world.y;
+    double const total_len = std::sqrt(dx * dx + dy * dy);
+    if (total_len < 1e-9) return;
+    double const inv_len = 1.0 / total_len;
+    double const nx = dx * inv_len;
+    double const ny = dy * inv_len;
+
+    double t = 0.0;
+    std::size_t i = 0;
+    int safety = static_cast<int>(dashes.size()) * 1024 + 16;
+    while (t < total_len && safety-- > 0) {
+        double const v = dashes[i % dashes.size()];
+        double const seg_len = std::abs(v);
+        if (seg_len < 1e-9) {
+            // Dot — visible only at thickness scale; skip in this cut.
+            ++i;
+            continue;
+        }
+        double const t_end = std::min(t + seg_len, total_len);
+        if (v > 0.0 && t_end > t + 1e-12) {
+            Point const p0{a_world.x + nx * t,     a_world.y + ny * t};
+            Point const p1{a_world.x + nx * t_end, a_world.y + ny * t_end};
+            out.lines.push_back(Line{
+                xf.apply_point(p0.x, p0.y),
+                xf.apply_point(p1.x, p1.y),
+                color, layer_name,
+            });
+        }
+        t = t_end;
+        ++i;
+    }
+}
+
 // De Boor evaluation of a non-rational B-spline at parameter `t`.
 // `ctrl` is the control polygon, `knots` is the knot vector
 // (length == ctrl.size() + degree + 1 for a clamped uniform spline).
@@ -217,12 +325,23 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const* line = obj->tio.entity->tio.LINE;
             if (!line) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
-            out.lines.push_back(Line{
-                xf.apply_point(line->start.x, line->start.y),
-                xf.apply_point(line->end.x,   line->end.y),
-                meta.color,
-                std::move(meta.layer_name),
-            });
+            auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+            if (dashes.empty()) {
+                out.lines.push_back(Line{
+                    xf.apply_point(line->start.x, line->start.y),
+                    xf.apply_point(line->end.x,   line->end.y),
+                    meta.color,
+                    std::move(meta.layer_name),
+                });
+            } else {
+                // Slab 7 — pre-decompose the dashed LINE into one
+                // `Line` per dash. Renderer stays unchanged.
+                decompose_dashed_line(
+                    Point{line->start.x, line->start.y},
+                    Point{line->end.x,   line->end.y},
+                    dashes, xf,
+                    meta.color, meta.layer_name, out);
+            }
             ++out.line_count;
             break;
         }
@@ -702,6 +821,28 @@ void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
                 l->frozen != 0,
                 l->off    != 0,
             });
+        }
+        return;
+    }
+
+    // Slab 7 — LTYPE table entries (DWG_SUPERTYPE_OBJECT). Captured so
+    // the summary card can show how many linetypes the file ships;
+    // the LINE-side dashing in `extract_entity_xf` resolves directly
+    // through `dwg_ref_object` for accuracy, not through this list.
+    if (obj->supertype == DWG_SUPERTYPE_OBJECT
+        && static_cast<int>(obj->fixedtype) == DWG_TYPE_LTYPE) {
+        auto const* lt = obj->tio.object->tio.LTYPE;
+        if (lt != nullptr && lt->name != nullptr) {
+            Linetype line_type{};
+            line_type.name = lt->name;
+            if (lt->dashes != nullptr) {
+                line_type.dashes.reserve(lt->numdashes);
+                for (BITCODE_RC i = 0; i < lt->numdashes; ++i) {
+                    line_type.dashes.push_back(lt->dashes[i].length);
+                }
+            }
+            out.linetypes.push_back(std::move(line_type));
+            ++out.linetype_count;
         }
         return;
     }
