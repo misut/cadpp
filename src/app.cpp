@@ -166,7 +166,10 @@ void view(State const& state) {
                 // so the lines are not clipped by the canvas edge on
                 // backends that snap to pixel rows.
                 constexpr float kBorder = 2.0f;
-                constexpr Color kBorderColor{107, 114, 128, 255}; // theme.muted
+                // Qualify with `phenotype::` because Slab 3 added a
+                // cad++-side `Color` struct (parser.hpp) that shadows
+                // phenotype's `Color` inside the `cadpp` namespace.
+                constexpr phenotype::Color kBorderColor{107, 114, 128, 255}; // theme.muted
                 float inset = kBorder * 0.5f;
                 float w = kCanvasWidth  - inset;
                 float h = kCanvasHeight - inset;

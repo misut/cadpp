@@ -7,8 +7,11 @@ namespace cadpp {
 
 namespace {
 
-constexpr phenotype::Color kInkColor{26, 26, 26, 255};   // near-black
 constexpr float kLineThickness = 1.0f;
+
+inline phenotype::Color to_paint(Color const& c) {
+    return phenotype::Color{c.r, c.g, c.b, c.a};
+}
 
 } // namespace
 
@@ -20,7 +23,7 @@ void render_lines(phenotype::Painter& p,
         auto const b = transform.apply(l.b.x, l.b.y);
         p.line(static_cast<float>(a.x), static_cast<float>(a.y),
                static_cast<float>(b.x), static_cast<float>(b.y),
-               kLineThickness, kInkColor);
+               kLineThickness, to_paint(l.color));
     }
 }
 
@@ -41,7 +44,7 @@ void render_texts(phenotype::Painter& p,
                static_cast<float>(top_left.y),
                t.content.data(),
                static_cast<unsigned int>(t.content.size()),
-               font_px, kInkColor);
+               font_px, to_paint(t.color));
     }
 }
 
