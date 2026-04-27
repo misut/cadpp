@@ -7,6 +7,8 @@
 
 import std;
 import phenotype;
+import phenotype.native;
+import phenotype.state;
 
 namespace cadpp {
 
@@ -61,25 +63,62 @@ std::string format_summary(Entities const& e) {
     return out;
 }
 
-State::State() {
-    apply_platform_theme();
-    source_path = g_dwg_path;
+void State::load(std::string path) {
+    source_path = std::move(path);
     entities = parse_file(source_path);
     if (entities.ok) {
         transform = ViewportTransform::fit(
             compute_bbox(entities), kCanvasWidth, kCanvasHeight);
+    } else {
+        transform = ViewportTransform{};
     }
 }
 
-void update(State&, Msg) {}
+State::State() {
+    apply_platform_theme();
+    load(g_dwg_path);
+}
+
+namespace {
+
+// Trampoline for `phenotype::native::dialog::open_file`. The dialog
+// backend hands us a NUL-terminated UTF-8 path (or null on cancel)
+// from the application's main event-loop thread, so it is safe to
+// post a message back into the same view/update loop.
+//
+// Phenotype's message queue is type-erased — we just instantiate the
+// post<Msg> template here with cad++'s own Msg variant so the runner
+// drains it through update(state, msg).
+extern "C" void on_picked(char const* path) {
+    if (path == nullptr) {
+        return;  // user cancelled
+    }
+    phenotype::detail::post<Msg>(FileChosen{ std::string(path) });
+    phenotype::detail::trigger_rebuild();
+}
+
+} // namespace
+
+void update(State& state, Msg msg) {
+    std::visit([&](auto const& m) {
+        using T = std::decay_t<decltype(m)>;
+        if constexpr (std::is_same_v<T, OpenRequested>) {
+            phenotype::native::dialog::open_file("dwg", &on_picked);
+        } else if constexpr (std::is_same_v<T, FileChosen>) {
+            state.load(m.path);
+        }
+    }, msg);
+}
 
 void view(State const& state) {
     using namespace phenotype;
     layout::padded(SpaceToken::Lg, [&] {
         layout::column([&] {
             widget::text("cad++", TextSize::Heading);
-            widget::text("M5 — text entities (TEXT + MTEXT)",
+            widget::text("M6d — file picker via phenotype platform_api",
                          TextSize::Small, TextColor::Muted);
+            widget::button<Msg>("Open...", OpenRequested{},
+                                ButtonVariant::Primary);
             widget::text("File: " + state.source_path,
                          TextSize::Small, TextColor::Muted);
             widget::code(format_summary(state.entities));

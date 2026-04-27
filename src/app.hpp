@@ -43,10 +43,28 @@ struct State {
     std::string source_path;
 
     State();
+
+    // Re-parse `path` and refit the viewport. Called from update()
+    // when the platform file dialog returns with a new file.
+    void load(std::string path);
 };
 
 struct Noop {};
-using Msg = std::variant<Noop>;
+
+// Dispatched from the toolbar "Open..." button. update() responds by
+// invoking the platform file dialog; the dialog backend's callback
+// (synchronous on macOS, asynchronous on Android) posts FileChosen.
+struct OpenRequested {};
+
+// Dispatched by the dialog's C callback once the user confirms a
+// selection. `path` is the filesystem path that LibreDWG can open
+// directly — backends that pick from non-filesystem sources stage the
+// bytes to a cache file before posting this message.
+struct FileChosen {
+    std::string path;
+};
+
+using Msg = std::variant<Noop, OpenRequested, FileChosen>;
 
 void update(State&, Msg);
 
