@@ -39,7 +39,14 @@ mise exec -- intron install
 mise exec -- exon run
 ```
 
-A 900×700 window with a "cad++" placeholder appears.
+A 900×800 window opens, parses `test/fixtures/sample_2000.dwg` and
+draws its lines / circles / polylines / text in a fixed canvas.
+
+Pass a path to override the bundled sample:
+
+```sh
+.exon/debug/cadpp /path/to/your-drawing.dwg
+```
 
 ## License
 

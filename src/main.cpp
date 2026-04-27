@@ -40,14 +40,24 @@ std::string format_summary(cadpp::Entities const& e) {
 
 } // namespace
 
+// `phenotype::native::run_app` default-constructs the user's State
+// internally, so the file path can't ride on the State's constructor
+// without help from main(). This global is set by main() before
+// run_app starts and read by State() during the first construction.
+namespace cadpp {
+namespace {
+std::string g_dwg_path = "test/fixtures/sample_2000.dwg";
+}
+}  // namespace cadpp
+
 struct State {
     cadpp::Entities entities;
     cadpp::ViewportTransform transform;
+    std::string source_path;
 
-    // phenotype::native::run_app default-constructs State internally,
-    // so initialisation has to happen here rather than in main().
     State() {
-        entities = cadpp::parse_file("test/fixtures/sample_2000.dwg");
+        source_path = cadpp::g_dwg_path;
+        entities = cadpp::parse_file(source_path);
         if (entities.ok) {
             transform = cadpp::ViewportTransform::fit(
                 cadpp::compute_bbox(entities), kCanvasWidth, kCanvasHeight);
@@ -67,7 +77,7 @@ void view(State const& state) {
             widget::text("cad++", TextSize::Heading);
             widget::text("M5 — text entities (TEXT + MTEXT)",
                          TextSize::Small, TextColor::Muted);
-            widget::text("Sample: test/fixtures/sample_2000.dwg",
+            widget::text("File: " + state.source_path,
                          TextSize::Small, TextColor::Muted);
             widget::code(format_summary(state.entities));
             widget::canvas(kCanvasWidth, kCanvasHeight,
@@ -79,6 +89,9 @@ void view(State const& state) {
     });
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc >= 2 && argv[1] && argv[1][0] != '\0') {
+        cadpp::g_dwg_path = argv[1];
+    }
     return phenotype::native::run_app<State, Msg>(900, 800, "cad++", view, update);
 }
