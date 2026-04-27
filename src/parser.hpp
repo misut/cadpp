@@ -152,6 +152,23 @@ struct Layer {
     bool        off    = false;  // DWG flag bit 2 — invisible but still regenerated
 };
 
+// Slab 7 — DWG LTYPE (linetype) table entry. `dashes` carries the
+// raw signed pattern (positive = dash, negative = gap, zero = dot;
+// units = world coords). The parser pre-decomposes each LINE entity
+// along its resolved linetype into multiple `Line` records — one per
+// dash — so the existing `Painter::line` emit path renders the
+// pattern as a sequence of solid segments without phenotype API
+// changes.
+//
+// Curves (ARC / CIRCLE / ELLIPSE / SPLINE / bulged-LWPOLYLINE) keep
+// their solid stroke for now; dashing them would require walking the
+// parameterised path. Straight LINE coverage already accounts for
+// the dominant CAD usage (centerlines, hidden edges, axis lines).
+struct Linetype {
+    std::string         name;
+    std::vector<double> dashes;
+};
+
 // Slab 2.a: parse a .dwg file into native draw primitives. CIRCLE
 // and ARC ride a dedicated `Arc` list (no parse-time chord
 // tessellation) so phenotype's `Painter::arc` rasterises them at
@@ -175,6 +192,7 @@ struct Entities {
     std::vector<Spline>  splines;                  // AutoCAD SPLINE entities (Slab 5)
     std::vector<Hatch>   hatches;                  // AutoCAD HATCH entities (Slab 5)
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
+    std::vector<Linetype> linetypes;               // DWG LTYPE table (Slab 7)
 
     // Source-entity counts (before tessellation) so the summary card
     // can show what kinds of geometry came in.
@@ -189,6 +207,7 @@ struct Entities {
     unsigned int minsert_count = 0;    // Slab 5 — MINSERT (rectangular array INSERT) entities
     unsigned int dimension_count = 0;  // Slab 5 — DIMENSION pre-rendered blocks expanded
     unsigned int hatch_count = 0;      // Slab 5 — HATCH boundary loops captured
+    unsigned int linetype_count = 0;   // Slab 7 — LTYPE table entries captured
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.

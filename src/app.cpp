@@ -65,6 +65,7 @@ std::string format_summary(Entities const& e) {
            + std::to_string(e.minsert_count)   + " MINSERT(s), "
            + std::to_string(e.dimension_count) + " DIMENSION(s), "
            + std::to_string(e.hatch_count)     + " HATCH(s)\n";
+    out += "Linetypes: " + std::to_string(e.linetype_count) + "\n";
     out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";
     out += "Other entities (skipped): " + std::to_string(e.unknown_entities);
     return out;
