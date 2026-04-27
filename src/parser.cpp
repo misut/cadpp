@@ -506,6 +506,152 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             ++out.dimension_count;
             break;
         }
+        case DWG_TYPE_HATCH: {
+            auto const* h = obj->tio.entity->tio.HATCH;
+            if (!h || h->num_paths == 0 || h->paths == nullptr) {
+                ++out.unknown_entities; break;
+            }
+            auto meta = resolve_entity_metadata(obj->tio.entity);
+            Hatch hatch{};
+            hatch.color      = meta.color;
+            hatch.layer_name = std::move(meta.layer_name);
+            hatch.solid      = h->is_solid_fill != 0;
+
+            // Discretisation count for arc / bulge sweeps. 32 chords
+            // is smooth at typical CAD HATCH scales (room interiors,
+            // detail dashes); refining via radius-aware step is a
+            // future optimisation.
+            constexpr int kArcSegments = 32;
+
+            for (BITCODE_BL pi = 0; pi < h->num_paths; ++pi) {
+                auto const& path = h->paths[pi];
+                std::vector<Point> loop;
+
+                bool const is_polyline = (path.flag & 0x2) != 0;
+                if (is_polyline && path.polyline_paths != nullptr) {
+                    BITCODE_BL const n = path.num_segs_or_paths;
+                    if (n < 2) continue;
+                    for (BITCODE_BL i = 0; i < n; ++i) {
+                        auto const& v = path.polyline_paths[i];
+                        Point const a = xf.apply_point(v.point.x, v.point.y);
+                        if (i == 0) {
+                            loop.push_back(a);
+                            continue;
+                        }
+                        // Bulge encodes a circular arc between this
+                        // vertex and the previous one (`bulge =
+                        // tan(θ / 4)`, sign = sweep direction). For
+                        // first-cut HATCH we discretise non-zero
+                        // bulges into chord polylines and treat
+                        // zero-bulge segments as straight chords.
+                        auto const& prev_v = path.polyline_paths[i - 1];
+                        double const bulge = h->paths[pi].bulges_present
+                            ? prev_v.bulge : 0.0;
+                        if (bulge == 0.0) {
+                            loop.push_back(a);
+                        } else {
+                            // Compute world-frame arc, then sample.
+                            double const dx = v.point.x - prev_v.point.x;
+                            double const dy = v.point.y - prev_v.point.y;
+                            double const chord = std::sqrt(dx * dx + dy * dy);
+                            if (chord < 1e-9) {
+                                loop.push_back(a);
+                                continue;
+                            }
+                            double const abs_b = std::abs(bulge);
+                            double const radius =
+                                chord * (1.0 + bulge * bulge) / (4.0 * abs_b);
+                            double const k =
+                                (1.0 - bulge * bulge) / (4.0 * bulge);
+                            double const mx = 0.5 * (prev_v.point.x + v.point.x);
+                            double const my = 0.5 * (prev_v.point.y + v.point.y);
+                            double const cx = mx - dy * k;
+                            double const cy = my + dx * k;
+                            double sa = std::atan2(prev_v.point.y - cy,
+                                                   prev_v.point.x - cx);
+                            double ea = std::atan2(v.point.y - cy,
+                                                   v.point.x - cx);
+                            if (bulge < 0.0) std::swap(sa, ea);
+                            double sweep = ea - sa;
+                            if (sweep < 0.0) sweep += 2.0 * kPi;
+                            for (int s = 1; s <= kArcSegments; ++s) {
+                                double const t = sa + sweep
+                                    * static_cast<double>(s)
+                                    / static_cast<double>(kArcSegments);
+                                Point const p = xf.apply_point(
+                                    cx + radius * std::cos(t),
+                                    cy + radius * std::sin(t));
+                                loop.push_back(p);
+                            }
+                            // ArcTo end-point already included as the
+                            // loop's last sample (s == kArcSegments
+                            // hits exactly `(v.point.x, v.point.y)`
+                            // up to floating-point error), so no
+                            // explicit `loop.push_back(a)` needed.
+                        }
+                    }
+                } else if (path.segs != nullptr) {
+                    BITCODE_BL const n = path.num_segs_or_paths;
+                    for (BITCODE_BL i = 0; i < n; ++i) {
+                        auto const& seg = path.segs[i];
+                        // curve_type: 1=LINE, 2=CIRCULAR ARC,
+                        // 3=ELLIPTICAL ARC, 4=SPLINE.
+                        if (seg.curve_type == 1) {
+                            Point const a = xf.apply_point(
+                                seg.first_endpoint.x, seg.first_endpoint.y);
+                            if (loop.empty()) loop.push_back(a);
+                            Point const b = xf.apply_point(
+                                seg.second_endpoint.x,
+                                seg.second_endpoint.y);
+                            loop.push_back(b);
+                        } else if (seg.curve_type == 2) {
+                            double sa = seg.start_angle;
+                            double ea = seg.end_angle;
+                            if (!seg.is_ccw) std::swap(sa, ea);
+                            double sweep = ea - sa;
+                            if (sweep < 0.0) sweep += 2.0 * kPi;
+                            // Seed the loop with the arc's start
+                            // point so the prior seg's end (if any)
+                            // joins cleanly via the LineTo emit when
+                            // we walk the polyline at render time.
+                            if (loop.empty()) {
+                                Point const start = xf.apply_point(
+                                    seg.center.x + seg.radius * std::cos(sa),
+                                    seg.center.y + seg.radius * std::sin(sa));
+                                loop.push_back(start);
+                            }
+                            for (int s = 1; s <= kArcSegments; ++s) {
+                                double const t = sa + sweep
+                                    * static_cast<double>(s)
+                                    / static_cast<double>(kArcSegments);
+                                Point const p = xf.apply_point(
+                                    seg.center.x + seg.radius * std::cos(t),
+                                    seg.center.y + seg.radius * std::sin(t));
+                                loop.push_back(p);
+                            }
+                        }
+                        // ELLIPTICAL ARC (3) and SPLINE (4) edge
+                        // segments are out of scope; they are rare
+                        // in HATCH boundaries and would degenerate
+                        // to a chord at first cut. Skip them — the
+                        // loop may end up as a coarse approximation
+                        // but won't crash.
+                    }
+                }
+
+                if (loop.size() >= 3) {
+                    hatch.loops.push_back(std::move(loop));
+                }
+            }
+
+            if (!hatch.loops.empty()) {
+                out.hatches.push_back(std::move(hatch));
+                ++out.hatch_count;
+            } else {
+                ++out.unknown_entities;
+            }
+            break;
+        }
         default:
             ++out.unknown_entities;
             break;

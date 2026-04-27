@@ -62,7 +62,8 @@ std::string format_summary(Entities const& e) {
            + std::to_string(e.text_count)     + " text(s)\n";
     out += "Composite entities: "
            + std::to_string(e.insert_count)    + " INSERT(s), "
-           + std::to_string(e.dimension_count) + " DIMENSION(s)\n";
+           + std::to_string(e.dimension_count) + " DIMENSION(s), "
+           + std::to_string(e.hatch_count)     + " HATCH(s)\n";
     out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";
     out += "Other entities (skipped): " + std::to_string(e.unknown_entities);
     return out;
@@ -236,6 +237,10 @@ void view(State const& state) {
                     p.line(w,     h,     inset, h,     kBorder, kBorderColor);
                     p.line(inset, h,     inset, inset, kBorder, kBorderColor);
 
+                    // Hatches render first so subsequent strokes /
+                    // arcs / text overlay correctly. CAD convention.
+                    render_hatches(p, state.entities, state.transform,
+                                   state.layer_visible);
                     render_lines(p, state.entities, state.transform,
                                  state.layer_visible);
                     render_arcs(p, state.entities, state.transform,

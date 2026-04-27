@@ -42,4 +42,13 @@ void render_paths(phenotype::Painter& p,
                   ViewportTransform const& transform,
                   LayerVisibility const& visibility);
 
+// HATCH boundary loops → `Painter::fill_path` (Slab 5). Each loop
+// dispatches as one fill_path call; multi-loop HATCHes (with holes)
+// overprint with the same colour — the even-odd cut-out is not
+// visible until a multi-loop fill pipeline lands.
+void render_hatches(phenotype::Painter& p,
+                    Entities const& entities,
+                    ViewportTransform const& transform,
+                    LayerVisibility const& visibility);
+
 } // namespace cadpp
