@@ -150,12 +150,173 @@ std::vector<double> resolve_entity_dashes(
     for (BITCODE_RC i = 0; i < lt->numdashes; ++i) {
         dashes.push_back(lt->dashes[i].length);
     }
+    // Slab 7c — apply the global header `LTSCALE` and per-entity
+    // `ltype_scale`, matching CAD's "linetype scale" convention.
+    // Both default to 1.0; non-default values stretch / shrink the
+    // pattern in world units.
+    double pattern_scale = 1.0;
+    if (dwg != nullptr && dwg->header_vars.LTSCALE > 0.0) {
+        pattern_scale *= dwg->header_vars.LTSCALE;
+    }
+    if (ent->ltype_scale > 0.0) {
+        pattern_scale *= ent->ltype_scale;
+    }
+    if (pattern_scale != 1.0) {
+        for (auto& d : dashes) d *= pattern_scale;
+    }
     // Degenerate (all-zero) pattern would loop forever in the
     // decomposer; treat it as solid.
     double sum = 0.0;
     for (double v : dashes) sum += std::abs(v);
     if (sum < 1e-9) return {};
     return dashes;
+}
+
+// Slab 7c — walk an N-vertex polyline (open or closed), decomposing
+// it into one `Line` record per dash interval. Continues the dash
+// pattern across vertex boundaries so multi-segment polylines
+// preserve a continuous dash flow (matches CAD's "PEDIT" behaviour).
+//
+// `points` are stored in the target coordinate system (already xf-
+// transformed for INSERT-expanded geometry); `dashes` is in the same
+// distance scale (caller has already applied `xf.scale_factor()` for
+// INSERT scaling on top of LTSCALE / ent->ltype_scale).
+void decompose_dashed_polyline(std::vector<Point> const& points,
+                               bool closed,
+                               std::vector<double> const& dashes,
+                               Color const& color,
+                               std::string const& layer_name,
+                               float thickness,
+                               Entities& out) {
+    if (points.size() < 2) return;
+    double pattern_total = 0.0;
+    for (double v : dashes) pattern_total += std::abs(v);
+    if (pattern_total < 1e-9) {
+        // Degenerate pattern — emit the polyline solid.
+        for (std::size_t i = 1; i < points.size(); ++i) {
+            out.lines.push_back(Line{
+                points[i - 1], points[i],
+                color, layer_name, thickness});
+        }
+        if (closed) {
+            out.lines.push_back(Line{
+                points.back(), points.front(),
+                color, layer_name, thickness});
+        }
+        return;
+    }
+
+    double dash_pos = 0.0;        // distance into current dash element
+    std::size_t dash_idx = 0;     // index into the dash pattern
+    int safety = static_cast<int>(points.size()) * 4096 + 16;
+
+    auto walk = [&](Point const& p0, Point const& p1) {
+        double const dx = p1.x - p0.x;
+        double const dy = p1.y - p0.y;
+        double const seg_len = std::sqrt(dx * dx + dy * dy);
+        if (seg_len < 1e-12) return;
+        double const inv_len = 1.0 / seg_len;
+        double const ux = dx * inv_len;
+        double const uy = dy * inv_len;
+
+        double consumed = 0.0;
+        Point cursor = p0;
+        while (consumed < seg_len && safety-- > 0) {
+            double const dash_v = dashes[dash_idx % dashes.size()];
+            double const dash_len = std::abs(dash_v);
+            if (dash_len < 1e-9) {
+                // Dot — visible only with thickness; skip.
+                ++dash_idx;
+                dash_pos = 0.0;
+                continue;
+            }
+            double const remaining_dash = dash_len - dash_pos;
+            double const remaining_seg  = seg_len - consumed;
+            double const step = std::min(remaining_dash, remaining_seg);
+            Point const next_cursor{
+                cursor.x + ux * step, cursor.y + uy * step};
+            if (dash_v > 0.0 && step > 1e-12) {
+                out.lines.push_back(Line{
+                    cursor, next_cursor,
+                    color, layer_name, thickness});
+            }
+            cursor = next_cursor;
+            consumed += step;
+            dash_pos += step;
+            if (dash_pos >= dash_len - 1e-9) {
+                dash_pos = 0.0;
+                ++dash_idx;
+            }
+        }
+    };
+
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        walk(points[i - 1], points[i]);
+    }
+    if (closed) walk(points.back(), points.front());
+}
+
+// Slab 7c — sample a circular arc into a chord polyline. Used as the
+// fallback when `Painter::arc` can't render the entity (e.g. when the
+// arc carries a dashed linetype and needs to be decomposed into
+// individual line segments). 64 samples per `2π` sweep is smooth at
+// typical CAD zooms; refining via radius-aware step is a future
+// optimisation.
+std::vector<Point> sample_arc_polyline(double cx, double cy, double radius,
+                                       double start_angle, double end_angle,
+                                       Affine const& xf) {
+    std::vector<Point> pts;
+    double sweep = end_angle - start_angle;
+    if (sweep <= 0.0) sweep += kTwoPi;
+    if (sweep > kTwoPi) sweep = kTwoPi;
+    int const samples =
+        std::max(8, static_cast<int>(std::ceil(64.0 * sweep / kTwoPi)));
+    pts.reserve(samples + 1);
+    for (int i = 0; i <= samples; ++i) {
+        double const t = start_angle + sweep
+            * static_cast<double>(i) / static_cast<double>(samples);
+        pts.push_back(xf.apply_point(
+            cx + radius * std::cos(t),
+            cy + radius * std::sin(t)));
+    }
+    return pts;
+}
+
+// Slab 7c — sample an AutoCAD ELLIPSE arc into a chord polyline.
+// Mirrors the renderer's parametric evaluation but emits points
+// directly so the linetype decomposer can dash them. Center +
+// major_axis are already in the target (xf-transformed) coord
+// system; xf is reapplied identity-style to stay symmetric with
+// `sample_arc_polyline` (caller passes the same xf used elsewhere
+// in the entity case).
+std::vector<Point> sample_ellipse_polyline(
+        Point center, Point major_axis, double minor_ratio,
+        double start_param, double end_param, Affine const& xf) {
+    std::vector<Point> pts;
+    double t0 = start_param;
+    double t1 = end_param;
+    if (std::abs(t1 - t0) < 1e-9) t1 = t0 + kTwoPi;
+    if (t1 < t0) t1 += kTwoPi;
+
+    double const ux =  major_axis.x;
+    double const uy =  major_axis.y;
+    double const vx = -uy * minor_ratio;
+    double const vy =  ux * minor_ratio;
+
+    double const sweep = t1 - t0;
+    int const samples =
+        std::max(16, static_cast<int>(std::ceil(64.0 * sweep / kTwoPi)));
+    pts.reserve(samples + 1);
+    for (int i = 0; i <= samples; ++i) {
+        double const t = t0 + sweep
+            * static_cast<double>(i) / static_cast<double>(samples);
+        Point const w{
+            center.x + ux * std::cos(t) + vx * std::sin(t),
+            center.y + uy * std::cos(t) + vy * std::sin(t),
+        };
+        pts.push_back(xf.apply_point(w.x, w.y));
+    }
+    return pts;
 }
 
 // Slab 7 — walk a straight LINE under the linetype's dash pattern,
@@ -396,18 +557,33 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto meta = resolve_entity_metadata(obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
-            // Circle is full sweep, so adding the affine's net rotation
-            // to start / end leaves the swept range == 2π — preserves
-            // the closed-circle invariant under any rotation.
-            double const rot = xf.rotation();
-            out.arcs.push_back(Arc{
-                xf.apply_point(c->center.x, c->center.y),
-                c->radius * xf.scale_factor(),
-                rot, rot + kTwoPi,
-                meta.color,
-                std::move(meta.layer_name),
-                thickness,
-            });
+            auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+            if (dashes.empty()) {
+                // Solid — keep the native arc primitive (SDF-rendered
+                // by phenotype, zoom-stable smoothness).
+                double const rot = xf.rotation();
+                out.arcs.push_back(Arc{
+                    xf.apply_point(c->center.x, c->center.y),
+                    c->radius * xf.scale_factor(),
+                    rot, rot + kTwoPi,
+                    meta.color,
+                    std::move(meta.layer_name),
+                    thickness,
+                });
+            } else {
+                // Slab 7c — dashed circle: sample to a polyline and
+                // decompose into dashed line segments. Trade-off:
+                // loses the SDF arc smoothness when dashed.
+                if (xf.scale_factor() != 1.0) {
+                    for (auto& d : dashes) d *= xf.scale_factor();
+                }
+                auto pts = sample_arc_polyline(
+                    c->center.x, c->center.y, c->radius,
+                    0.0, kTwoPi, xf);
+                decompose_dashed_polyline(
+                    pts, /*closed=*/true, dashes,
+                    meta.color, meta.layer_name, thickness, out);
+            }
             ++out.circle_count;
             break;
         }
@@ -417,15 +593,28 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto meta = resolve_entity_metadata(obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
-            double const rot = xf.rotation();
-            out.arcs.push_back(Arc{
-                xf.apply_point(a->center.x, a->center.y),
-                a->radius * xf.scale_factor(),
-                a->start_angle + rot, a->end_angle + rot,
-                meta.color,
-                std::move(meta.layer_name),
-                thickness,
-            });
+            auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+            if (dashes.empty()) {
+                double const rot = xf.rotation();
+                out.arcs.push_back(Arc{
+                    xf.apply_point(a->center.x, a->center.y),
+                    a->radius * xf.scale_factor(),
+                    a->start_angle + rot, a->end_angle + rot,
+                    meta.color,
+                    std::move(meta.layer_name),
+                    thickness,
+                });
+            } else {
+                if (xf.scale_factor() != 1.0) {
+                    for (auto& d : dashes) d *= xf.scale_factor();
+                }
+                auto pts = sample_arc_polyline(
+                    a->center.x, a->center.y, a->radius,
+                    a->start_angle, a->end_angle, xf);
+                decompose_dashed_polyline(
+                    pts, /*closed=*/false, dashes,
+                    meta.color, meta.layer_name, thickness, out);
+            }
             ++out.arc_count;
             break;
         }
@@ -485,7 +674,17 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 }
             }
 
-            if (any_bulge) {
+            auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+            if (xf.scale_factor() != 1.0 && !dashes.empty()) {
+                for (auto& d : dashes) d *= xf.scale_factor();
+            }
+
+            if (any_bulge && dashes.empty()) {
+                // Solid bulged polyline — keep the native arc-aware
+                // path. Dashed bulged polylines fall through to the
+                // chord-flatten branch below; arc shape is lost when
+                // dashed but the visual still reads as a dashed
+                // polyline.
                 BulgedPolyline bp{};
                 bp.color      = color;
                 bp.closed     = closed;
@@ -516,19 +715,25 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     verts.push_back(
                         xf.apply_point(p->points[i].x, p->points[i].y));
                 }
-                for (BITCODE_BL i = 1; i < npts; ++i) {
-                    out.lines.push_back(Line{
-                        verts[i - 1], verts[i],
-                        color, layer_name,
-                        thickness,
-                    });
-                }
-                if (closed) {
-                    out.lines.push_back(Line{
-                        verts[npts - 1], verts[0],
-                        color, layer_name,
-                        thickness,
-                    });
+                if (dashes.empty()) {
+                    for (BITCODE_BL i = 1; i < npts; ++i) {
+                        out.lines.push_back(Line{
+                            verts[i - 1], verts[i],
+                            color, layer_name,
+                            thickness,
+                        });
+                    }
+                    if (closed) {
+                        out.lines.push_back(Line{
+                            verts[npts - 1], verts[0],
+                            color, layer_name,
+                            thickness,
+                        });
+                    }
+                } else {
+                    decompose_dashed_polyline(
+                        verts, closed, dashes,
+                        color, layer_name, thickness, out);
                 }
             }
             ++out.polyline_count;
@@ -552,16 +757,36 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto meta = resolve_entity_metadata(obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
-            out.ellipses.push_back(Ellipse{
-                xf.apply_point(e->center.x, e->center.y),
-                xf.apply_vector(e->sm_axis.x, e->sm_axis.y),
-                e->axis_ratio,
-                e->start_angle,
-                e->end_angle,
-                meta.color,
-                std::move(meta.layer_name),
-                thickness,
-            });
+            auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+            Point const center_w = xf.apply_point(e->center.x, e->center.y);
+            Point const major_w  = xf.apply_vector(e->sm_axis.x, e->sm_axis.y);
+            if (dashes.empty()) {
+                out.ellipses.push_back(Ellipse{
+                    center_w, major_w,
+                    e->axis_ratio,
+                    e->start_angle,
+                    e->end_angle,
+                    meta.color,
+                    std::move(meta.layer_name),
+                    thickness,
+                });
+            } else {
+                if (xf.scale_factor() != 1.0) {
+                    for (auto& d : dashes) d *= xf.scale_factor();
+                }
+                // The ellipse evaluator already takes coords in the
+                // target frame, so pass the identity transform — the
+                // points returned are already in the same coord
+                // system as the dash pattern.
+                auto pts = sample_ellipse_polyline(
+                    center_w, major_w, e->axis_ratio,
+                    e->start_angle, e->end_angle, Affine::identity());
+                bool const ellipse_closed =
+                    std::abs(e->end_angle - e->start_angle) < 1e-9;
+                decompose_dashed_polyline(
+                    pts, ellipse_closed, dashes,
+                    meta.color, meta.layer_name, thickness, out);
+            }
             ++out.ellipse_count;
             break;
         }
@@ -635,7 +860,17 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             }
 
             if (sp.points.size() >= 2) {
-                out.splines.push_back(std::move(sp));
+                auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+                if (dashes.empty()) {
+                    out.splines.push_back(std::move(sp));
+                } else {
+                    if (xf.scale_factor() != 1.0) {
+                        for (auto& d : dashes) d *= xf.scale_factor();
+                    }
+                    decompose_dashed_polyline(
+                        sp.points, sp.closed, dashes,
+                        sp.color, sp.layer_name, sp.thickness, out);
+                }
                 ++out.spline_count;
             } else {
                 ++out.unknown_entities;
