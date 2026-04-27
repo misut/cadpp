@@ -174,6 +174,7 @@ void decompose_dashed_line(Point a_world, Point b_world,
                            Affine const& xf,
                            Color const& color,
                            std::string const& layer_name,
+                           float thickness,
                            Entities& out) {
     double const dx = b_world.x - a_world.x;
     double const dy = b_world.y - a_world.y;
@@ -201,12 +202,53 @@ void decompose_dashed_line(Point a_world, Point b_world,
             out.lines.push_back(Line{
                 xf.apply_point(p0.x, p0.y),
                 xf.apply_point(p1.x, p1.y),
-                color, layer_name,
+                color, layer_name, thickness,
             });
         }
         t = t_end;
         ++i;
     }
+}
+
+// Slab 7 — DWG lineweight sentinel codes. Real values are mm × 100
+// (so 25 = 0.25mm, 50 = 0.50mm, etc.). Anything matching the three
+// sentinels below falls through to the layer's lineweight, then to
+// the cad++ default (1 px).
+constexpr int kLwByLayer = 28;
+constexpr int kLwByBlock = 29;
+constexpr int kLwDefault = 30;
+
+// Slab 7 — resolve an entity's effective lineweight in canvas pixels.
+//
+// Maps the DWG lineweight value (in 0.01 mm units) to a stroke
+// thickness via a flat 0.05 px-per-unit factor with a 1 px floor.
+// Lineweight stays pixel-frame, not world-frame — strokes keep a
+// constant on-screen weight at any zoom, matching every CAD viewer's
+// "lineweight display" mode.
+//
+// Resolution order: entity own `linewt` → layer `linewt` (BYLAYER /
+// BYBLOCK / DEFAULT fallback) → 1 px default.
+float resolve_entity_lineweight_px(Dwg_Object_Entity const* ent) {
+    constexpr float kDefaultPx   = 1.0f;
+    constexpr float kPxPerLinewt = 0.05f;
+
+    auto cvt = [&](int lw) -> std::optional<float> {
+        if (lw == kLwByLayer || lw == kLwByBlock || lw == kLwDefault) {
+            return std::nullopt;
+        }
+        if (lw < 0 || lw > 211) return std::nullopt;
+        return std::max(1.0f, static_cast<float>(lw) * kPxPerLinewt);
+    };
+
+    if (ent == nullptr) return kDefaultPx;
+    int const ent_lw = static_cast<int>(ent->linewt);
+    if (auto v = cvt(ent_lw)) return *v;
+
+    Dwg_Object_LAYER* layer = dwg_get_entity_layer(ent);
+    if (layer != nullptr) {
+        if (auto v = cvt(static_cast<int>(layer->linewt))) return *v;
+    }
+    return kDefaultPx;
 }
 
 // De Boor evaluation of a non-rational B-spline at parameter `t`.
@@ -325,6 +367,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const* line = obj->tio.entity->tio.LINE;
             if (!line) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            float const thickness =
+                resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
             if (dashes.empty()) {
                 out.lines.push_back(Line{
@@ -332,6 +376,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     xf.apply_point(line->end.x,   line->end.y),
                     meta.color,
                     std::move(meta.layer_name),
+                    thickness,
                 });
             } else {
                 // Slab 7 — pre-decompose the dashed LINE into one
@@ -340,7 +385,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     Point{line->start.x, line->start.y},
                     Point{line->end.x,   line->end.y},
                     dashes, xf,
-                    meta.color, meta.layer_name, out);
+                    meta.color, meta.layer_name, thickness, out);
             }
             ++out.line_count;
             break;
@@ -349,6 +394,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            float const thickness =
+                resolve_entity_lineweight_px(obj->tio.entity);
             // Circle is full sweep, so adding the affine's net rotation
             // to start / end leaves the swept range == 2π — preserves
             // the closed-circle invariant under any rotation.
@@ -359,6 +406,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 rot, rot + kTwoPi,
                 meta.color,
                 std::move(meta.layer_name),
+                thickness,
             });
             ++out.circle_count;
             break;
@@ -367,6 +415,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            float const thickness =
+                resolve_entity_lineweight_px(obj->tio.entity);
             double const rot = xf.rotation();
             out.arcs.push_back(Arc{
                 xf.apply_point(a->center.x, a->center.y),
@@ -374,6 +424,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 a->start_angle + rot, a->end_angle + rot,
                 meta.color,
                 std::move(meta.layer_name),
+                thickness,
             });
             ++out.arc_count;
             break;
@@ -412,6 +463,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 ++out.unknown_entities; break;
             }
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            float const thickness =
+                resolve_entity_lineweight_px(obj->tio.entity);
             Color const color = meta.color;
             std::string const layer_name = meta.layer_name;
             auto const npts = p->num_points;
@@ -437,6 +490,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 bp.color      = color;
                 bp.closed     = closed;
                 bp.layer_name = layer_name;
+                bp.thickness  = thickness;
                 bp.vertices.reserve(npts);
                 for (BITCODE_BL i = 0; i < npts; ++i) {
                     bp.vertices.push_back(
@@ -466,12 +520,14 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     out.lines.push_back(Line{
                         verts[i - 1], verts[i],
                         color, layer_name,
+                        thickness,
                     });
                 }
                 if (closed) {
                     out.lines.push_back(Line{
                         verts[npts - 1], verts[0],
                         color, layer_name,
+                        thickness,
                     });
                 }
             }
@@ -494,6 +550,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // similarity transforms; non-uniform INSERT scale would
             // distort the ellipse — accepted approximation.
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            float const thickness =
+                resolve_entity_lineweight_px(obj->tio.entity);
             out.ellipses.push_back(Ellipse{
                 xf.apply_point(e->center.x, e->center.y),
                 xf.apply_vector(e->sm_axis.x, e->sm_axis.y),
@@ -502,6 +560,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 e->end_angle,
                 meta.color,
                 std::move(meta.layer_name),
+                thickness,
             });
             ++out.ellipse_count;
             break;
@@ -513,6 +572,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             Spline sp{};
             sp.color      = meta.color;
             sp.layer_name = std::move(meta.layer_name);
+            sp.thickness  = resolve_entity_lineweight_px(obj->tio.entity);
             // Bit 0 of legacy flag, plus bit 2 of the 2013+ splineflags.
             sp.closed = (s->closed_b != 0)
                         || ((s->splineflags & 0x4) != 0);

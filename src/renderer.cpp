@@ -13,7 +13,6 @@ namespace cadpp {
 
 namespace {
 
-constexpr float  kLineThickness = 1.0f;
 constexpr double kHalfPi = 1.57079632679489661923;
 constexpr double kTwoPi  = 6.28318530717958647692;
 
@@ -44,7 +43,7 @@ void render_lines(phenotype::Painter& p,
         auto const b = transform.apply(l.b.x, l.b.y);
         p.line(static_cast<float>(a.x), static_cast<float>(a.y),
                static_cast<float>(b.x), static_cast<float>(b.y),
-               kLineThickness, to_paint(l.color));
+               l.thickness, to_paint(l.color));
     }
 }
 
@@ -91,7 +90,7 @@ void render_arcs(phenotype::Painter& p,
               static_cast<float>(center_canvas.y),
               r_px,
               canvas_start, canvas_end,
-              kLineThickness, to_paint(a.color));
+              a.thickness, to_paint(a.color));
     }
 }
 
@@ -159,7 +158,7 @@ void render_paths(phenotype::Painter& p,
                        static_cast<float>(c.y));
         }
         if (sp.closed) pb.close();
-        p.stroke_path(pb, kLineThickness, to_paint(sp.color));
+        p.stroke_path(pb, sp.thickness, to_paint(sp.color));
     }
 
     // ---- Bulged LWPOLYLINE → MoveTo + (LineTo | ArcTo) chain ----
@@ -209,7 +208,7 @@ void render_paths(phenotype::Painter& p,
             }
         }
         if (bp.closed) pb.close();
-        p.stroke_path(pb, kLineThickness, to_paint(bp.color));
+        p.stroke_path(pb, bp.thickness, to_paint(bp.color));
     }
 
     // ---- ELLIPSE → MoveTo + cubic_to per ≤90° quadrant ----
@@ -290,7 +289,7 @@ void render_paths(phenotype::Painter& p,
                         static_cast<float>(cb.x), static_cast<float>(cb.y));
             tA = tB;
         }
-        p.stroke_path(pb, kLineThickness, to_paint(e.color));
+        p.stroke_path(pb, e.thickness, to_paint(e.color));
     }
 }
 
