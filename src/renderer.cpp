@@ -294,4 +294,31 @@ void render_paths(phenotype::Painter& p,
     }
 }
 
+void render_hatches(phenotype::Painter& p,
+                    Entities const& entities,
+                    ViewportTransform const& transform,
+                    LayerVisibility const& visibility) {
+    // One `fill_path` per boundary loop. The parser already
+    // discretised every curve segment into a polyline at parse
+    // time, so the renderer just walks each loop's vertex list as a
+    // `MoveTo + LineTo*` chain. Phenotype's `fill_path` implicitly
+    // closes the polygon, so no explicit `Close` verb is needed.
+    for (auto const& h : entities.hatches) {
+        if (!is_visible(visibility, h.layer_name)) continue;
+        for (auto const& loop : h.loops) {
+            if (loop.size() < 3) continue;
+            phenotype::PathBuilder pb;
+            auto const start = transform.apply(loop[0].x, loop[0].y);
+            pb.move_to(static_cast<float>(start.x),
+                       static_cast<float>(start.y));
+            for (std::size_t i = 1; i < loop.size(); ++i) {
+                auto const c = transform.apply(loop[i].x, loop[i].y);
+                pb.line_to(static_cast<float>(c.x),
+                           static_cast<float>(c.y));
+            }
+            p.fill_path(pb, to_paint(h.color));
+        }
+    }
+}
+
 } // namespace cadpp

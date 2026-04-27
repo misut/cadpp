@@ -115,6 +115,29 @@ struct Spline {
     std::string        layer_name;
 };
 
+// AutoCAD HATCH entity (Slab 5). Each HATCH carries one or more
+// boundary loops; the parser flattens every loop into a vector of
+// world-space `Point`s by approximating curve segments at parse
+// time (LINE seg → 2 points, CIRCULAR ARC seg → 32-chord polyline,
+// polyline path with bulge → arc-chord polyline). The renderer
+// (`render_hatches`) walks each loop into a `phenotype::PathBuilder`
+// polyline and dispatches via `Painter::fill_path`.
+//
+// Multi-loop HATCH (a HATCH with holes) emits each loop as its own
+// `fill_path` call; the holes overprint with the same colour so the
+// even-odd cut-out is not visible. Real holes need a multi-loop
+// fill pipeline and stay out of scope.
+//
+// `solid = true` is the only fill style rendered for now —
+// patterned and gradient HATCH entities surface as flat-colour
+// fills until pattern / gradient pipelines land.
+struct Hatch {
+    std::vector<std::vector<Point>> loops;  // each loop ≥ 3 vertices, world coords
+    Color                           color{};
+    std::string                     layer_name;
+    bool                            solid = true;
+};
+
 // Slab 4 — DWG LAYER table entry. Drawing entities reference layers
 // either explicitly (the entity's `layer_name`) or implicitly (BYLAYER
 // colour fall-through). Frozen / off layers are normally hidden by the
@@ -150,6 +173,7 @@ struct Entities {
     std::vector<BulgedPolyline> bulged_polylines;  // LWPOLYLINE with any non-zero bulge
     std::vector<Ellipse> ellipses;                 // AutoCAD ELLIPSE entities
     std::vector<Spline>  splines;                  // AutoCAD SPLINE entities (Slab 5)
+    std::vector<Hatch>   hatches;                  // AutoCAD HATCH entities (Slab 5)
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
 
     // Source-entity counts (before tessellation) so the summary card
@@ -163,6 +187,7 @@ struct Entities {
     unsigned int text_count = 0;
     unsigned int insert_count = 0;     // Slab 5 — INSERT block instances expanded
     unsigned int dimension_count = 0;  // Slab 5 — DIMENSION pre-rendered blocks expanded
+    unsigned int hatch_count = 0;      // Slab 5 — HATCH boundary loops captured
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.
