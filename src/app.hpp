@@ -37,10 +37,22 @@ constexpr float kCanvasHeight = 500.0f;
 
 std::string format_summary(Entities const& e);
 
+// `std::unordered_map` link-fails under libc++ + `import std;` (the
+// `__hash_memory` undefined-symbol trap), so the layer-visibility
+// map is an ordered map. Layer counts are tiny (~50 for real DWGs)
+// and the ordering happens to give the panel a stable, predictable
+// alphabetical layer list — no sort step needed in the view.
+using LayerVisibility = std::map<std::string, bool>;
+
 struct State {
     Entities entities;
     ViewportTransform transform;
     std::string source_path;
+    // Layer name -> rendered? Initialised from each layer's
+    // `frozen` / `off` flag at parse time so the viewer matches the
+    // DWG's stored visibility on first paint, but the user can flip
+    // any of them through the layer panel without touching the file.
+    LayerVisibility layer_visible;
 
     State();
 
@@ -83,7 +95,16 @@ struct Zoom {
     float focus_y = 0.0f;
 };
 
-using Msg = std::variant<Noop, OpenRequested, FileChosen, Pan, Zoom>;
+// Dispatched by the layer panel's per-row checkbox. update() flips
+// the named layer's entry in `State::layer_visible`; subsequent
+// view() rebuilds skip rendering entities that name a now-hidden
+// layer. The DWG file itself is never modified.
+struct ToggleLayer {
+    std::string name;
+};
+
+using Msg = std::variant<Noop, OpenRequested, FileChosen,
+                         Pan, Zoom, ToggleLayer>;
 
 void update(State&, Msg);
 

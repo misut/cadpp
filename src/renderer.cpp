@@ -21,12 +21,25 @@ inline phenotype::Color to_paint(Color const& c) {
     return phenotype::Color{c.r, c.g, c.b, c.a};
 }
 
+// Slab 4 — layer visibility filter. Entities without a resolved layer
+// are always rendered; entities whose layer doesn't appear in the map
+// are visible by default (the panel only inserts the layers it knows
+// about). Entities whose layer is in the map and false get skipped.
+inline bool is_visible(LayerVisibility const& v,
+                       std::string const& layer_name) {
+    if (layer_name.empty()) return true;
+    auto it = v.find(layer_name);
+    return it == v.end() ? true : it->second;
+}
+
 } // namespace
 
 void render_lines(phenotype::Painter& p,
                   Entities const& entities,
-                  ViewportTransform const& transform) {
+                  ViewportTransform const& transform,
+                  LayerVisibility const& visibility) {
     for (auto const& l : entities.lines) {
+        if (!is_visible(visibility, l.layer_name)) continue;
         auto const a = transform.apply(l.a.x, l.a.y);
         auto const b = transform.apply(l.b.x, l.b.y);
         p.line(static_cast<float>(a.x), static_cast<float>(a.y),
@@ -37,9 +50,11 @@ void render_lines(phenotype::Painter& p,
 
 void render_texts(phenotype::Painter& p,
                   Entities const& entities,
-                  ViewportTransform const& transform) {
+                  ViewportTransform const& transform,
+                  LayerVisibility const& visibility) {
     for (auto const& t : entities.texts) {
         if (t.content.empty()) continue;
+        if (!is_visible(visibility, t.layer_name)) continue;
         // CAD's insertion_pt sits on the text's baseline; canvas's
         // text() takes the top-left of the font-size box. Move up by
         // `height` in CAD (= down by `height * scale` in canvas) to
@@ -58,8 +73,10 @@ void render_texts(phenotype::Painter& p,
 
 void render_arcs(phenotype::Painter& p,
                  Entities const& entities,
-                 ViewportTransform const& transform) {
+                 ViewportTransform const& transform,
+                 LayerVisibility const& visibility) {
     for (auto const& a : entities.arcs) {
+        if (!is_visible(visibility, a.layer_name)) continue;
         auto const center_canvas = transform.apply(a.center.x, a.center.y);
         float const r_px = static_cast<float>(a.radius * transform.scale);
         if (r_px < 0.5f) continue;  // sub-pixel — skip
@@ -119,10 +136,12 @@ inline BulgeArc bulge_to_arc(Point const& a, Point const& b, double bulge) {
 
 void render_paths(phenotype::Painter& p,
                   Entities const& entities,
-                  ViewportTransform const& transform) {
+                  ViewportTransform const& transform,
+                  LayerVisibility const& visibility) {
     // ---- Bulged LWPOLYLINE → MoveTo + (LineTo | ArcTo) chain ----
     for (auto const& bp : entities.bulged_polylines) {
         if (bp.vertices.size() < 2) continue;
+        if (!is_visible(visibility, bp.layer_name)) continue;
         phenotype::PathBuilder pb;
 
         auto const start_canvas =
@@ -187,6 +206,7 @@ void render_paths(phenotype::Painter& p,
     // points in CAD-world space and then transform every point through
     // `ViewportTransform::apply` — the y-flip is automatic.
     for (auto const& e : entities.ellipses) {
+        if (!is_visible(visibility, e.layer_name)) continue;
         // Major axis vector U; perpendicular V is U rotated 90° CCW
         // (in CAD's y-up frame) scaled by minor_ratio.
         double const ux =  e.major_axis.x;

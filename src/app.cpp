@@ -66,6 +66,13 @@ std::string format_summary(Entities const& e) {
 void State::load(std::string path) {
     source_path = std::move(path);
     entities = parse_file(source_path);
+    layer_visible.clear();
+    for (auto const& layer : entities.layers) {
+        // Match the DWG file's stored visibility on first paint —
+        // `frozen` and `off` layers start hidden; the user can flip
+        // them on through the layer panel without touching the file.
+        layer_visible[layer.name] = !(layer.frozen || layer.off);
+    }
     if (entities.ok) {
         transform = ViewportTransform::fit(
             compute_bbox(entities), kCanvasWidth, kCanvasHeight);
@@ -113,6 +120,11 @@ void update(State& state, Msg msg) {
             state.transform.zoom_at(static_cast<double>(m.factor),
                                     static_cast<double>(m.focus_x),
                                     static_cast<double>(m.focus_y));
+        } else if constexpr (std::is_same_v<T, ToggleLayer>) {
+            auto it = state.layer_visible.find(m.name);
+            if (it != state.layer_visible.end()) {
+                it->second = !it->second;
+            }
         }
     }, msg);
 }
@@ -156,45 +168,80 @@ void on_canvas_gesture(phenotype::GestureEvent const& ev) {
 
 } // namespace
 
+namespace {
+
+void render_layer_panel(State const& state) {
+    using namespace phenotype;
+    if (state.entities.layers.empty()) return;
+    layout::card([&] {
+        widget::text("Layers", TextSize::Body);
+        layout::column([&] {
+            for (auto const& layer : state.entities.layers) {
+                auto it = state.layer_visible.find(layer.name);
+                bool const visible =
+                    (it == state.layer_visible.end()) ? true : it->second;
+                widget::checkbox<Msg>(
+                    layer.name, visible,
+                    ToggleLayer{layer.name});
+            }
+        }, SpaceToken::Xs);
+    });
+}
+
+} // namespace
+
 void view(State const& state) {
     using namespace phenotype;
     layout::padded(SpaceToken::Lg, [&] {
         layout::column([&] {
             widget::text("cad++", TextSize::Heading);
-            widget::text("Slab 1 — pan / pinch-zoom on the drawing canvas",
+            widget::text("Slab 4 — layer model + visibility panel",
                          TextSize::Small, TextColor::Muted);
             widget::button<Msg>("Open...", OpenRequested{},
                                 ButtonVariant::Primary);
             widget::text("File: " + state.source_path,
                          TextSize::Small, TextColor::Muted);
             widget::code(format_summary(state.entities));
-            widget::canvas(kCanvasWidth, kCanvasHeight,
-                           [&state](Painter& p) {
-                // Frame the drawing region so the user can tell where
-                // the gesture-active surface starts and ends — without
-                // it the canvas blends into the page background.
-                // Stroked from the inside (offset by half-thickness)
-                // so the lines are not clipped by the canvas edge on
-                // backends that snap to pixel rows.
-                constexpr float kBorder = 2.0f;
-                // Qualify with `phenotype::` because Slab 3 added a
-                // cad++-side `Color` struct (parser.hpp) that shadows
-                // phenotype's `Color` inside the `cadpp` namespace.
-                constexpr phenotype::Color kBorderColor{107, 114, 128, 255}; // theme.muted
-                float inset = kBorder * 0.5f;
-                float w = kCanvasWidth  - inset;
-                float h = kCanvasHeight - inset;
-                p.line(inset, inset, w,     inset, kBorder, kBorderColor);
-                p.line(w,     inset, w,     h,     kBorder, kBorderColor);
-                p.line(w,     h,     inset, h,     kBorder, kBorderColor);
-                p.line(inset, h,     inset, inset, kBorder, kBorderColor);
+            // Sidebar (layer panel) on the left, canvas on the right.
+            // CrossAxisAlignment::Start keeps the sidebar pinned to
+            // the top edge instead of vertical-centring against the
+            // taller canvas.
+            layout::row([&] {
+                layout::column([&] {
+                    render_layer_panel(state);
+                }, SpaceToken::Md);
+                widget::canvas(kCanvasWidth, kCanvasHeight,
+                               [&state](Painter& p) {
+                    // Frame the drawing region so the user can tell where
+                    // the gesture-active surface starts and ends — without
+                    // it the canvas blends into the page background.
+                    // Stroked from the inside (offset by half-thickness)
+                    // so the lines are not clipped by the canvas edge on
+                    // backends that snap to pixel rows.
+                    constexpr float kBorder = 2.0f;
+                    // Qualify with `phenotype::` because Slab 3 added a
+                    // cad++-side `Color` struct (parser.hpp) that shadows
+                    // phenotype's `Color` inside the `cadpp` namespace.
+                    constexpr phenotype::Color kBorderColor{107, 114, 128, 255}; // theme.muted
+                    float inset = kBorder * 0.5f;
+                    float w = kCanvasWidth  - inset;
+                    float h = kCanvasHeight - inset;
+                    p.line(inset, inset, w,     inset, kBorder, kBorderColor);
+                    p.line(w,     inset, w,     h,     kBorder, kBorderColor);
+                    p.line(w,     h,     inset, h,     kBorder, kBorderColor);
+                    p.line(inset, h,     inset, inset, kBorder, kBorderColor);
 
-                render_lines(p, state.entities, state.transform);
-                render_arcs(p, state.entities, state.transform);
-                render_paths(p, state.entities, state.transform);
-                render_texts(p, state.entities, state.transform);
-            },
-                           &on_canvas_gesture);
+                    render_lines(p, state.entities, state.transform,
+                                 state.layer_visible);
+                    render_arcs(p, state.entities, state.transform,
+                                state.layer_visible);
+                    render_paths(p, state.entities, state.transform,
+                                 state.layer_visible);
+                    render_texts(p, state.entities, state.transform,
+                                 state.layer_visible);
+                },
+                               &on_canvas_gesture);
+            }, SpaceToken::Lg, CrossAxisAlignment::Start);
         });
     });
 }
