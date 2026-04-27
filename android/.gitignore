@@ -1,0 +1,5 @@
+# Gradle workspace artifacts.
+build/
+.cxx/
+.gradle/
+local.properties

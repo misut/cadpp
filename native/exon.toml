@@ -1,0 +1,29 @@
+[package]
+# Desktop binary for cad++. The executable link step lives here so the
+# parent package can stay `type = "lib"` (which is what the Android
+# build path needs — see ../exon.toml). Both Apple Security frameworks
+# below are required by phenotype's macOS Metal backend at link time;
+# they bubble up through this binary, not through the cadpp library.
+name = "cadpp-native"
+version = "0.0.1"
+description = "cad++ desktop entry (macOS / Windows)"
+type = "bin"
+standard = 23
+build-system = "cmake"
+platforms = [
+    { os = "macos", arch = "aarch64" },
+    { os = "windows", arch = "x86_64" },
+]
+
+[sync]
+cmake-in-root = false
+
+[target.'cfg(os = "macos")'.build]
+ldflags = ["-framework", "Security", "-Wl,-framework,CoreFoundation"]
+
+[dependencies]
+"github.com/misut/cppx" = "1.9.0"
+
+[dependencies.path]
+cadpp = ".."
+phenotype = "../../phenotype"

@@ -2,18 +2,23 @@
 name = "cadpp"
 version = "0.0.1"
 description = "cad++ — DWG viewer (Android + macOS) built on phenotype"
-type = "bin"
+# Library archive consumed by either the desktop binary in `native/` or
+# the Android NDK glue under `android/app/src/main/cpp/`. Splitting `int
+# main` out of this package is what unblocks `--target
+# aarch64-linux-android`: Android apps load shared libraries via
+# GameActivity, so an executable link step at the top level can never
+# produce a runnable artefact there. Desktop targets keep the same
+# binary ergonomics through the `native` subpackage.
+type = "lib"
 standard = 23
 platforms = [
     { os = "macos", arch = "aarch64" },
     { os = "windows", arch = "x86_64" },
+    { os = "android", arch = "aarch64" },
 ]
 
 [sync]
 cmake-in-root = false
-
-[target.'cfg(os = "macos")'.build]
-ldflags = ["-framework", "Security", "-Wl,-framework,CoreFoundation"]
 
 [target.'cfg(os = "macos")'.dependencies.cmake.libredwg]
 git = "https://github.com/LibreDWG/libredwg.git"
@@ -40,6 +45,19 @@ tag = "0.13.4"
 targets = "libredwg"
 
 [target.'cfg(os = "windows")'.dependencies.cmake.libredwg.options]
+LIBREDWG_LIBONLY = "ON"
+LIBREDWG_DISABLE_WRITE = "ON"
+LIBREDWG_DISABLE_JSON = "ON"
+DISABLE_WERROR = "ON"
+BUILD_SHARED_LIBS = "OFF"
+ENABLE_LTO = "OFF"
+
+[target.'cfg(os = "android")'.dependencies.cmake.libredwg]
+git = "https://github.com/LibreDWG/libredwg.git"
+tag = "0.13.4"
+targets = "redwg"
+
+[target.'cfg(os = "android")'.dependencies.cmake.libredwg.options]
 LIBREDWG_LIBONLY = "ON"
 LIBREDWG_DISABLE_WRITE = "ON"
 LIBREDWG_DISABLE_JSON = "ON"

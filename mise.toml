@@ -4,3 +4,69 @@ cmake = "latest"
 "vfox:misut/mise-exon" = "0.30.2"
 "vfox:misut/mise-intron" = "0.21.5"
 ninja = "latest"
+
+# Android developer workflow. Mirrors phenotype's tools/android layout
+# (see tools/android/_env.sh for env defaults). Override knobs locally
+# via `.mise/config.toml` or plain env vars before invoking `mise run`.
+#
+#   mise run android            # default alias -> android:run
+#   mise run android:doctor     # verify SDK / NDK / JDK / AVD setup
+#   mise run android:run        # emu:start → build → apk → install → launch
+
+[tasks."android"]
+description = "Shortcut for android:run"
+depends = ["android:run"]
+
+[tasks."android:doctor"]
+description = "Report SDK / NDK / JDK / AVD status for the Android workflow"
+run = "tools/android/doctor.sh"
+
+[tasks."android:build"]
+description = "Cross-compile cadpp static libraries for aarch64-linux-android"
+run = "mise exec -- exon build --target aarch64-linux-android"
+
+[tasks."android:apk"]
+description = "Gradle assembleDebug for android/"
+depends = ["android:build"]
+run = "tools/android/apk.sh"
+
+[tasks."android:emu:list"]
+description = "List configured AVDs and currently-online adb devices"
+run = "tools/android/emu_list.sh"
+
+[tasks."android:emu:start"]
+description = "Boot $CADPP_ANDROID_AVD (or the first AVD) and wait for boot_completed"
+run = "tools/android/emu_start.sh"
+
+[tasks."android:emu:stop"]
+description = "Shut down the running emulator"
+run = "tools/android/emu_stop.sh"
+
+[tasks."android:install"]
+description = "adb install -r on $CADPP_ANDROID_APK"
+depends = ["android:apk"]
+run = "tools/android/install.sh"
+
+[tasks."android:launch"]
+description = "am start the cad++ activity"
+run = "tools/android/launch.sh"
+
+[tasks."android:stop"]
+description = "am force-stop cad++"
+run = "tools/android/stop.sh"
+
+[tasks."android:logs"]
+description = "adb logcat filtered to cadpp + crash categories (live tail)"
+run = "tools/android/logs.sh"
+
+[tasks."android:screencap"]
+description = "Grab a PNG screenshot; opens it on macOS"
+run = "tools/android/screencap.sh"
+
+[tasks."android:run"]
+description = "End-to-end: boot emu → build → apk → install → launch → log snapshot"
+run = "tools/android/run.sh"
+
+[tasks."android:clean"]
+description = "gradle clean + wipe exon aarch64-linux-android output + stop emulator"
+run = "tools/android/clean.sh"

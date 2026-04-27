@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- phenotype's renderer requires Vulkan 1.1; min-sdk 33 covers
+         every Android image that ships a Vulkan 1.1 driver. -->
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:version="0x401000"
+        android:required="true" />
+
+    <application
+        android:label="cad++"
+        android:hasCode="true"
+        android:allowBackup="false">
+
+        <activity
+            android:name="io.github.misut.cadpp.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Cadpp"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode"
+            android:launchMode="singleTask">
+
+            <!-- GameActivity loads the .so by name; matches the cmake
+                 target in app/src/main/cpp/CMakeLists.txt. -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="cadpp_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
