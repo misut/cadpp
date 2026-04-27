@@ -25,10 +25,17 @@ struct Color {
     std::uint8_t a = 255;
 };
 
+// `layer_name` carries the DWG layer name the entity belongs to (Slab
+// 4). Empty when the parser couldn't resolve a layer for the entity —
+// e.g. the layer handle is missing or the layer isn't loaded yet. Used
+// for (a) BYLAYER colour fall-through (already done at parse time, so
+// the value baked into `color` is the resolved colour, not BYLAYER)
+// and (b) the layer panel's visibility / freeze toggle.
 struct Line {
     Point a;
     Point b;
     Color color{};
+    std::string layer_name;
 };
 
 struct Text {
@@ -36,6 +43,7 @@ struct Text {
     double height = 0.0;   // CAD units (font height in world space)
     std::string content;   // UTF-8 (LibreDWG normalises wide strings on read)
     Color color{};
+    std::string layer_name;
 };
 
 // CIRCLE and ARC entities, kept as native arcs so the renderer can
@@ -50,6 +58,7 @@ struct Arc {
     double start_angle = 0.0;
     double end_angle   = 0.0;
     Color  color{};
+    std::string layer_name;
 };
 
 // LWPOLYLINE with at least one non-zero `bulge` value. Each segment
@@ -65,6 +74,7 @@ struct BulgedPolyline {
     std::vector<double> bulges;
     bool                closed = false;
     Color               color{};
+    std::string         layer_name;
 };
 
 // AutoCAD ELLIPSE entity. `major_axis` is the vector (in CAD world
@@ -82,6 +92,21 @@ struct Ellipse {
     double start_param = 0.0;
     double end_param   = 0.0;
     Color  color{};
+    std::string layer_name;
+};
+
+// Slab 4 — DWG LAYER table entry. Drawing entities reference layers
+// either explicitly (the entity's `layer_name`) or implicitly (BYLAYER
+// colour fall-through). Frozen / off layers are normally hidden by the
+// renderer; cad++ exposes both flags through the layer panel so the
+// user can toggle layer visibility independently of the DWG file's
+// stored state. `color` is already resolved (CMC -> RGB) at parse time
+// so the renderer doesn't have to look back into LibreDWG.
+struct Layer {
+    std::string name;
+    Color       color{};
+    bool        frozen = false;  // DWG flag bit 1 — temporarily invisible + non-printable
+    bool        off    = false;  // DWG flag bit 2 — invisible but still regenerated
 };
 
 // Slab 2.a: parse a .dwg file into native draw primitives. CIRCLE
@@ -104,6 +129,7 @@ struct Entities {
     std::vector<Arc>  arcs;        // CIRCLE + ARC, native arcs (no chord tessellation)
     std::vector<BulgedPolyline> bulged_polylines;  // LWPOLYLINE with any non-zero bulge
     std::vector<Ellipse> ellipses;                 // AutoCAD ELLIPSE entities
+    std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
 
     // Source-entity counts (before tessellation) so the summary card
     // can show what kinds of geometry came in.
