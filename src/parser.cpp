@@ -21,17 +21,26 @@ constexpr double kTwoPi = 2.0 * kPi;
 constexpr int kColorMethodAci       = 0xc2;
 constexpr int kColorMethodTruecolor = 0xc3;
 
-// Translate a LibreDWG entity color into cad++'s RGBA. Returns the
-// default ink (Color{}) for BYLAYER / BYBLOCK / unknown methods —
-// cad++ has no layer model yet (Slab 4), so any layer-relative color
-// stays indistinguishable from the legacy flat-ink rendering.
-//
-// AutoCAD's ACI 7 ("white-on-dark, black-on-light") gets the same
-// fall-back: rendering ACI-7 lines as white on cad++'s light canvas
-// would make them invisible. Matches what every CAD viewer ships.
-Color resolve_color(Dwg_Object_Entity const* ent) {
-    if (ent == nullptr) return Color{};
-    auto const& c = ent->color;
+// True if the CMC carries an actual RGB value (truecolor or a usable
+// ACI palette index). False for BYLAYER / BYBLOCK / ACI-7 / unknown,
+// which all delegate to the layer's colour or, ultimately, to the
+// cad++ default ink (Color{}). ACI 7 ("white-on-dark, black-on-light")
+// stays a fall-through because rendering ACI-7 white-on-light would
+// be invisible — matches every CAD viewer.
+bool is_resolvable_cmc(Dwg_Color const& c) {
+    int const method = static_cast<int>(c.method);
+    if (method == kColorMethodTruecolor) return true;
+    if (method == kColorMethodAci) {
+        int const idx = static_cast<int>(c.index);
+        return idx > 0 && idx != 7 && idx < 256;
+    }
+    return false;
+}
+
+// Translate a resolvable CMC to RGBA. Non-resolvable CMCs return the
+// cad++ default ink — callers normally check `is_resolvable_cmc` first
+// and fall back to the layer's colour before hitting that branch.
+Color color_from_cmc(Dwg_Color const& c) {
     int const method = static_cast<int>(c.method);
     if (method == kColorMethodTruecolor) {
         std::uint32_t const rgb = static_cast<std::uint32_t>(c.rgb);
@@ -42,17 +51,51 @@ Color resolve_color(Dwg_Object_Entity const* ent) {
             255,
         };
     }
-    int const idx = static_cast<int>(c.index);
-    if (method != kColorMethodAci || idx <= 0 || idx == 7 || idx >= 256) {
-        return Color{};
+    if (method == kColorMethodAci) {
+        int const idx = static_cast<int>(c.index);
+        if (idx > 0 && idx != 7 && idx < 256) {
+            BITCODE_BL const packed = dwg_rgb_palette_index(
+                static_cast<BITCODE_BS>(idx));
+            return Color{
+                static_cast<std::uint8_t>((packed >> 16) & 0xff),
+                static_cast<std::uint8_t>((packed >>  8) & 0xff),
+                static_cast<std::uint8_t>( packed        & 0xff),
+                255,
+            };
+        }
     }
-    BITCODE_BL const packed = dwg_rgb_palette_index(static_cast<BITCODE_BS>(idx));
-    return Color{
-        static_cast<std::uint8_t>((packed >> 16) & 0xff),
-        static_cast<std::uint8_t>((packed >>  8) & 0xff),
-        static_cast<std::uint8_t>( packed        & 0xff),
-        255,
-    };
+    return Color{};
+}
+
+// Slab 4: bundle of (resolved colour, layer name) for one entity.
+// Doing both lookups in one helper means we only call
+// `dwg_get_entity_layer` once per entity — either to resolve a
+// BYLAYER / BYBLOCK / ACI-7 colour, or just to record which layer the
+// entity belongs to so the panel can toggle its visibility.
+struct EntityMetadata {
+    Color       color;
+    std::string layer_name;
+};
+
+EntityMetadata resolve_entity_metadata(Dwg_Object_Entity const* ent) {
+    EntityMetadata out{};
+    if (ent == nullptr) return out;
+
+    Dwg_Object_LAYER* layer = dwg_get_entity_layer(ent);
+    if (layer != nullptr && layer->name != nullptr) {
+        out.layer_name = layer->name;
+    }
+
+    if (is_resolvable_cmc(ent->color)) {
+        out.color = color_from_cmc(ent->color);
+    } else if (layer != nullptr && is_resolvable_cmc(layer->color)) {
+        // BYLAYER (or BYBLOCK / ACI-7 — same code path here) — fall
+        // back to the layer's stored colour. With Slab 4 in place this
+        // is what makes ACI-coded layer colours actually appear in the
+        // viewer instead of rendering as flat near-black ink.
+        out.color = color_from_cmc(layer->color);
+    }
+    return out;
 }
 
 char const* version_string(unsigned int v) {
@@ -71,6 +114,25 @@ char const* version_string(unsigned int v) {
 
 void extract(Dwg_Object const* obj, Entities& out) {
     if (!obj) return;
+
+    // LAYER table entries arrive as DWG objects (not entities) — capture
+    // them so the panel UI can list / toggle them and so the renderer
+    // can already see the resolved colour on each entity that defers to
+    // BYLAYER.
+    if (obj->supertype == DWG_SUPERTYPE_OBJECT
+        && static_cast<int>(obj->fixedtype) == DWG_TYPE_LAYER) {
+        auto const* l = obj->tio.object->tio.LAYER;
+        if (l != nullptr && l->name != nullptr) {
+            out.layers.push_back(Layer{
+                std::string(l->name),
+                color_from_cmc(l->color),
+                l->frozen != 0,
+                l->off    != 0,
+            });
+        }
+        return;
+    }
+
     if (obj->supertype != DWG_SUPERTYPE_ENTITY) return;
 
     auto const fixedtype = static_cast<int>(obj->fixedtype);
@@ -78,11 +140,12 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_LINE: {
             auto const* line = obj->tio.entity->tio.LINE;
             if (!line) { ++out.unknown_entities; break; }
-            Color const color = resolve_color(obj->tio.entity);
+            auto meta = resolve_entity_metadata(obj->tio.entity);
             out.lines.push_back(Line{
                 Point{line->start.x, line->start.y},
                 Point{line->end.x,   line->end.y},
-                color,
+                meta.color,
+                std::move(meta.layer_name),
             });
             ++out.line_count;
             break;
@@ -90,11 +153,13 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_CIRCLE: {
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
+            auto meta = resolve_entity_metadata(obj->tio.entity);
             out.arcs.push_back(Arc{
                 Point{c->center.x, c->center.y},
                 c->radius,
                 0.0, kTwoPi,
-                resolve_color(obj->tio.entity),
+                meta.color,
+                std::move(meta.layer_name),
             });
             ++out.circle_count;
             break;
@@ -102,11 +167,13 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_ARC: {
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
+            auto meta = resolve_entity_metadata(obj->tio.entity);
             out.arcs.push_back(Arc{
                 Point{a->center.x, a->center.y},
                 a->radius,
                 a->start_angle, a->end_angle,
-                resolve_color(obj->tio.entity),
+                meta.color,
+                std::move(meta.layer_name),
             });
             ++out.arc_count;
             break;
@@ -114,11 +181,13 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_TEXT: {
             auto const* t = obj->tio.entity->tio.TEXT;
             if (!t || !t->text_value) { ++out.unknown_entities; break; }
+            auto meta = resolve_entity_metadata(obj->tio.entity);
             out.texts.push_back(Text{
                 Point{t->ins_pt.x, t->ins_pt.y},
                 t->height,
                 std::string(t->text_value),
-                resolve_color(obj->tio.entity),
+                meta.color,
+                std::move(meta.layer_name),
             });
             ++out.text_count;
             break;
@@ -126,11 +195,13 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_MTEXT: {
             auto const* m = obj->tio.entity->tio.MTEXT;
             if (!m || !m->text) { ++out.unknown_entities; break; }
+            auto meta = resolve_entity_metadata(obj->tio.entity);
             out.texts.push_back(Text{
                 Point{m->ins_pt.x, m->ins_pt.y},
                 m->text_height,
                 std::string(m->text),
-                resolve_color(obj->tio.entity),
+                meta.color,
+                std::move(meta.layer_name),
             });
             ++out.text_count;
             break;
@@ -140,7 +211,9 @@ void extract(Dwg_Object const* obj, Entities& out) {
             if (!p || !p->points || p->num_points < 2) {
                 ++out.unknown_entities; break;
             }
-            Color const color = resolve_color(obj->tio.entity);
+            auto meta = resolve_entity_metadata(obj->tio.entity);
+            Color const color = meta.color;
+            std::string const layer_name = meta.layer_name;
             auto const npts = p->num_points;
             bool const closed = (p->flag & 0x1) != 0;
 
@@ -162,8 +235,9 @@ void extract(Dwg_Object const* obj, Entities& out) {
 
             if (any_bulge) {
                 BulgedPolyline bp{};
-                bp.color  = color;
-                bp.closed = closed;
+                bp.color      = color;
+                bp.closed     = closed;
+                bp.layer_name = layer_name;
                 bp.vertices.reserve(npts);
                 for (BITCODE_BL i = 0; i < npts; ++i) {
                     bp.vertices.push_back(Point{p->points[i].x,
@@ -182,14 +256,18 @@ void extract(Dwg_Object const* obj, Entities& out) {
                 for (BITCODE_BL i = 1; i < npts; ++i) {
                     auto const& a = p->points[i - 1];
                     auto const& b = p->points[i];
-                    out.lines.push_back(
-                        Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
+                    out.lines.push_back(Line{
+                        Point{a.x, a.y}, Point{b.x, b.y},
+                        color, layer_name,
+                    });
                 }
                 if (closed) {
                     auto const& a = p->points[npts - 1];
                     auto const& b = p->points[0];
-                    out.lines.push_back(
-                        Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
+                    out.lines.push_back(Line{
+                        Point{a.x, a.y}, Point{b.x, b.y},
+                        color, layer_name,
+                    });
                 }
             }
             ++out.polyline_count;
@@ -204,13 +282,15 @@ void extract(Dwg_Object const* obj, Entities& out) {
             // refer to the minor axis). `axis_ratio` is the minor /
             // major length ratio (≤ 1). `start_angle` / `end_angle`
             // are parametric, not geometric.
+            auto meta = resolve_entity_metadata(obj->tio.entity);
             out.ellipses.push_back(Ellipse{
                 Point{e->center.x, e->center.y},
                 Point{e->sm_axis.x, e->sm_axis.y},
                 e->axis_ratio,
                 e->start_angle,
                 e->end_angle,
-                resolve_color(obj->tio.entity),
+                meta.color,
+                std::move(meta.layer_name),
             });
             ++out.ellipse_count;
             break;
