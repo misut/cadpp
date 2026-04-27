@@ -62,6 +62,7 @@ std::string format_summary(Entities const& e) {
            + std::to_string(e.text_count)     + " text(s)\n";
     out += "Composite entities: "
            + std::to_string(e.insert_count)    + " INSERT(s), "
+           + std::to_string(e.minsert_count)   + " MINSERT(s), "
            + std::to_string(e.dimension_count) + " DIMENSION(s), "
            + std::to_string(e.hatch_count)     + " HATCH(s)\n";
     out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";

@@ -186,6 +186,7 @@ struct Entities {
     unsigned int spline_count = 0;
     unsigned int text_count = 0;
     unsigned int insert_count = 0;     // Slab 5 — INSERT block instances expanded
+    unsigned int minsert_count = 0;    // Slab 5 — MINSERT (rectangular array INSERT) entities
     unsigned int dimension_count = 0;  // Slab 5 — DIMENSION pre-rendered blocks expanded
     unsigned int hatch_count = 0;      // Slab 5 — HATCH boundary loops captured
 

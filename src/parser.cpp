@@ -470,10 +470,6 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // rotate(rotation) ∘ scale(scale.x, scale.y), in apply-
             // order. Compose with the inherited `xf` so nested
             // INSERTs accumulate correctly.
-            //
-            // MINSERT (rectangular array) is not handled here yet; it
-            // arrives as DWG_TYPE_MINSERT and will fall through to
-            // `default` (unknown_entities) in this PR.
             Affine const local =
                 Affine::translate(ins->ins_pt.x, ins->ins_pt.y)
                 .compose(Affine::rotate(ins->rotation))
@@ -481,6 +477,37 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             Affine const child_xf = xf.compose(local);
             expand_block(dwg, ins->block_header, child_xf, out);
             ++out.insert_count;
+            break;
+        }
+        case DWG_TYPE_MINSERT: {
+            // MINSERT — rectangular array INSERT. Same block, replicated
+            // num_cols × num_rows times with `(col_idx × col_spacing,
+            // row_idx × row_spacing)` offsets in the block's *pre-
+            // rotation, pre-scale* (block-local) frame, so the array
+            // axes follow the MINSERT's own rotation. Each cell expands
+            // the block under its own composed affine.
+            auto const* mins = obj->tio.entity->tio.MINSERT;
+            if (!mins) { ++out.unknown_entities; break; }
+            int const cols = static_cast<int>(mins->num_cols);
+            int const rows = static_cast<int>(mins->num_rows);
+            if (cols <= 0 || rows <= 0) {
+                ++out.unknown_entities; break;
+            }
+            Affine const local =
+                Affine::translate(mins->ins_pt.x, mins->ins_pt.y)
+                .compose(Affine::rotate(mins->rotation))
+                .compose(Affine::scale_xy(mins->scale.x, mins->scale.y));
+            Affine const base_xf = xf.compose(local);
+            for (int row = 0; row < rows; ++row) {
+                for (int col = 0; col < cols; ++col) {
+                    Affine const cell_offset = Affine::translate(
+                        static_cast<double>(col) * mins->col_spacing,
+                        static_cast<double>(row) * mins->row_spacing);
+                    Affine const cell_xf = base_xf.compose(cell_offset);
+                    expand_block(dwg, mins->block_header, cell_xf, out);
+                }
+            }
+            ++out.minsert_count;
             break;
         }
         case DWG_TYPE_DIMENSION_ORDINATE:
