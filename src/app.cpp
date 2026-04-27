@@ -159,6 +159,22 @@ void view(State const& state) {
             widget::code(format_summary(state.entities));
             widget::canvas(kCanvasWidth, kCanvasHeight,
                            [&state](Painter& p) {
+                // Frame the drawing region so the user can tell where
+                // the gesture-active surface starts and ends — without
+                // it the canvas blends into the page background.
+                // Stroked from the inside (offset by half-thickness)
+                // so the lines are not clipped by the canvas edge on
+                // backends that snap to pixel rows.
+                constexpr float kBorder = 2.0f;
+                constexpr Color kBorderColor{107, 114, 128, 255}; // theme.muted
+                float inset = kBorder * 0.5f;
+                float w = kCanvasWidth  - inset;
+                float h = kCanvasHeight - inset;
+                p.line(inset, inset, w,     inset, kBorder, kBorderColor);
+                p.line(w,     inset, w,     h,     kBorder, kBorderColor);
+                p.line(w,     h,     inset, h,     kBorder, kBorderColor);
+                p.line(inset, h,     inset, inset, kBorder, kBorderColor);
+
                 render_lines(p, state.entities, state.transform);
                 render_texts(p, state.entities, state.transform);
             },
