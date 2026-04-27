@@ -125,22 +125,33 @@ namespace {
 // safe here.
 void on_canvas_gesture(phenotype::GestureEvent const& ev) {
     using K = phenotype::GestureKind;
+    bool any = false;
     switch (ev.kind) {
     case K::Pan:
         if (ev.dx != 0.0f || ev.dy != 0.0f) {
             phenotype::detail::post<Msg>(Pan{ev.dx, ev.dy});
-            phenotype::detail::trigger_rebuild();
+            any = true;
         }
         break;
     case K::Pinch:
     case K::ScrollZoom:
+        // Android folds two-finger midpoint Pan + Pinch into a single
+        // GestureEvent (kind = Pinch). Posting both when present + a
+        // single trigger_rebuild() halves the view-rebuild rate on
+        // multi-pointer scrolls — the bottleneck behind the Galaxy
+        // S25 Ultra two-finger lag.
+        if (ev.dx != 0.0f || ev.dy != 0.0f) {
+            phenotype::detail::post<Msg>(Pan{ev.dx, ev.dy});
+            any = true;
+        }
         if (ev.pinch_scale != 1.0f) {
             phenotype::detail::post<Msg>(
                 Zoom{ev.pinch_scale, ev.focus_x, ev.focus_y});
-            phenotype::detail::trigger_rebuild();
+            any = true;
         }
         break;
     }
+    if (any) phenotype::detail::trigger_rebuild();
 }
 
 } // namespace
