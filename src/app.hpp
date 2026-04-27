@@ -64,7 +64,26 @@ struct FileChosen {
     std::string path;
 };
 
-using Msg = std::variant<Noop, OpenRequested, FileChosen>;
+// Translation of phenotype's `GestureKind::Pan` event — slides the
+// drawing under the user's finger / trackpad. Values are canvas-local
+// pixel deltas already, so update() forwards them straight to
+// `ViewportTransform::pan`.
+struct Pan {
+    float dx = 0.0f;
+    float dy = 0.0f;
+};
+
+// Translation of phenotype's `GestureKind::Pinch` / `ScrollZoom`
+// events. `factor` is the multiplicative zoom (1.0 ≡ no change),
+// applied around (`focus_x`, `focus_y`) so the world point under the
+// cursor stays under the cursor.
+struct Zoom {
+    float factor  = 1.0f;
+    float focus_x = 0.0f;
+    float focus_y = 0.0f;
+};
+
+using Msg = std::variant<Noop, OpenRequested, FileChosen, Pan, Zoom>;
 
 void update(State&, Msg);
 

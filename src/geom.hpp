@@ -83,6 +83,33 @@ struct ViewportTransform {
             pad_y + (bbox.max_y - wy) * scale,  // CAD Y is up; canvas Y is down.
         };
     }
+
+    // Slide the drawing under the cursor by `(dx_canvas, dy_canvas)`
+    // canvas pixels. Pure translation — `scale` is untouched.
+    void pan(double dx_canvas, double dy_canvas) {
+        pad_x += dx_canvas;
+        pad_y += dy_canvas;
+    }
+
+    // Multiply the scale by `factor`, anchored at the canvas-local
+    // point `(fx, fy)` so the world coordinate currently under that
+    // point stays under it after the zoom (standard "zoom toward
+    // cursor" affine identity). Floors the scale at a tiny positive
+    // value so a runaway pinch can't flip the transform inside-out.
+    void zoom_at(double factor, double fx, double fy) {
+        if (!(factor > 0.0)) return;
+        double new_scale = scale * factor;
+        if (!(new_scale > 1e-9)) new_scale = 1e-9;
+        // Solve for the world point at (fx, fy) under the OLD scale,
+        // then re-anchor pad_* so apply(wx, wy) == (fx, fy) under the
+        // NEW scale.
+        double inv = (scale > 0.0) ? 1.0 / scale : 0.0;
+        double wx  = bbox.min_x + (fx - pad_x) * inv;
+        double wy  = bbox.max_y - (fy - pad_y) * inv;
+        scale = new_scale;
+        pad_x = fx - (wx - bbox.min_x) * scale;
+        pad_y = fy - (bbox.max_y - wy) * scale;
+    }
 };
 
 } // namespace cadpp

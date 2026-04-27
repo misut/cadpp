@@ -43,6 +43,13 @@ void phenotype_android_install_file_dialog_handler(
     char const* request_method,
     char const* result_method);
 void phenotype_android_dispatch_pointer(float x, float y, int action);
+// Stage-8 multi-pointer entry. `pointer_id` is the Android-supplied
+// stable id from `GameActivityPointerAxes::id`; action codes match
+// dispatch_pointer (0=DOWN, 1=MOVE, 2=UP/CANCEL). Used in place of
+// dispatch_pointer here so phenotype's gesture state machine can see
+// every active finger on multi-touch events.
+void phenotype_android_dispatch_touch(int pointer_id, int action,
+                                      float x, float y);
 void phenotype_android_dispatch_key(int android_keycode, int action, int mods);
 void phenotype_android_dispatch_char(unsigned int codepoint);
 void phenotype_android_dispatch_scroll(double dy);
@@ -238,22 +245,41 @@ extern "C" void android_main(android_app* app) {
             for (uint64_t i = 0; i < ib->motionEventsCount; ++i) {
                 GameActivityMotionEvent const& ev = ib->motionEvents[i];
                 int32_t masked = ev.action & AMOTION_EVENT_ACTION_MASK;
-                int ptr = (ev.action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
-                        >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
-                float x = GameActivityPointerAxes_getX(&ev.pointers[ptr]);
-                float y = GameActivityPointerAxes_getY(&ev.pointers[ptr]);
+                int ptr_index = (ev.action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
+                              >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+                if (ptr_index < 0
+                    || static_cast<uint32_t>(ptr_index) >= ev.pointerCount) {
+                    ptr_index = 0;
+                }
                 if (masked == AMOTION_EVENT_ACTION_DOWN
                     || masked == AMOTION_EVENT_ACTION_POINTER_DOWN) {
-                    phenotype_android_dispatch_pointer(x, y, 0);
+                    GameActivityPointerAxes const& ax = ev.pointers[ptr_index];
+                    phenotype_android_dispatch_touch(
+                        ax.id, 0,
+                        GameActivityPointerAxes_getX(&ax),
+                        GameActivityPointerAxes_getY(&ax));
                 } else if (masked == AMOTION_EVENT_ACTION_MOVE) {
-                    phenotype_android_dispatch_pointer(x, y, 1);
+                    // Multi-pointer-aware: every active finger may have
+                    // moved this event, so iterate ev.pointers[] rather
+                    // than dispatching only the indexed pointer.
+                    for (uint32_t pi = 0; pi < ev.pointerCount; ++pi) {
+                        GameActivityPointerAxes const& ax = ev.pointers[pi];
+                        phenotype_android_dispatch_touch(
+                            ax.id, 1,
+                            GameActivityPointerAxes_getX(&ax),
+                            GameActivityPointerAxes_getY(&ax));
+                    }
                 } else if (masked == AMOTION_EVENT_ACTION_UP
                         || masked == AMOTION_EVENT_ACTION_POINTER_UP
                         || masked == AMOTION_EVENT_ACTION_CANCEL) {
-                    phenotype_android_dispatch_pointer(x, y, 2);
+                    GameActivityPointerAxes const& ax = ev.pointers[ptr_index];
+                    phenotype_android_dispatch_touch(
+                        ax.id, 2,
+                        GameActivityPointerAxes_getX(&ax),
+                        GameActivityPointerAxes_getY(&ax));
                 } else if (masked == AMOTION_EVENT_ACTION_SCROLL) {
                     float dy = GameActivityPointerAxes_getAxisValue(
-                        &ev.pointers[ptr], AMOTION_EVENT_AXIS_VSCROLL);
+                        &ev.pointers[ptr_index], AMOTION_EVENT_AXIS_VSCROLL);
                     if (dy != 0.0f) {
                         phenotype_android_dispatch_scroll(
                             static_cast<double>(dy));
