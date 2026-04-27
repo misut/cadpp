@@ -12,6 +12,38 @@ namespace cadpp {
 
 std::string g_dwg_path = "test/fixtures/sample_2000.dwg";
 
+namespace {
+
+// phenotype renders into the surface's physical pixels with no DPI
+// scaling, so a 1080×2400 phone shows the desktop default theme at
+// almost-illegible sizes. Scale typography and spacing ~2.5× on
+// Android — the same numbers stay 1× on desktop, where the GLFW
+// surface lines up with logical points.
+#ifdef __ANDROID__
+void apply_platform_theme() {
+    using phenotype::Theme;
+    Theme t;  // start from desktop defaults
+    t.body_font_size     *= 2.5f;
+    t.heading_font_size  *= 2.5f;
+    t.code_font_size     *= 2.5f;
+    t.small_font_size    *= 2.5f;
+    t.hero_title_size    *= 2.5f;
+    t.hero_subtitle_size *= 2.5f;
+    t.space_xs  *= 2.0f;
+    t.space_sm  *= 2.0f;
+    t.space_md  *= 2.0f;
+    t.space_lg  *= 2.0f;
+    t.space_xl  *= 2.0f;
+    t.space_2xl *= 2.0f;
+    t.space_3xl *= 2.0f;
+    phenotype::set_theme(t);
+}
+#else
+void apply_platform_theme() {}
+#endif
+
+} // namespace
+
 std::string format_summary(Entities const& e) {
     if (!e.ok) {
         return "Parse failed — " + e.error;
@@ -30,6 +62,7 @@ std::string format_summary(Entities const& e) {
 }
 
 State::State() {
+    apply_platform_theme();
     source_path = g_dwg_path;
     entities = parse_file(source_path);
     if (entities.ok) {
