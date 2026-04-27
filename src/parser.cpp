@@ -142,23 +142,77 @@ void extract(Dwg_Object const* obj, Entities& out) {
             }
             Color const color = resolve_color(obj->tio.entity);
             auto const npts = p->num_points;
-            for (BITCODE_BL i = 1; i < npts; ++i) {
-                auto const& a = p->points[i - 1];
-                auto const& b = p->points[i];
-                out.lines.push_back(Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
+            bool const closed = (p->flag & 0x1) != 0;
+
+            // Detect any non-zero bulge: those segments need to render
+            // as actual circular arcs, not straight chords. The whole
+            // polyline routes through `Painter::stroke_path` so the
+            // straight + arc segments stay one continuous, correctly-
+            // joined entity. Polylines with all-zero bulges keep the
+            // legacy flat-line emit path — same wire output as before
+            // Slab 2.c.
+            bool any_bulge = false;
+            if (p->bulges && p->num_bulges > 0) {
+                BITCODE_BL const nb =
+                    (p->num_bulges < npts) ? p->num_bulges : npts;
+                for (BITCODE_BL i = 0; i < nb; ++i) {
+                    if (p->bulges[i] != 0.0) { any_bulge = true; break; }
+                }
             }
-            // flag bit 0 (= LWPLINE_CLOSED) → close the loop with a
-            // segment from the last vertex back to the first.
-            if ((p->flag & 0x1) != 0) {
-                auto const& a = p->points[npts - 1];
-                auto const& b = p->points[0];
-                out.lines.push_back(Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
+
+            if (any_bulge) {
+                BulgedPolyline bp{};
+                bp.color  = color;
+                bp.closed = closed;
+                bp.vertices.reserve(npts);
+                for (BITCODE_BL i = 0; i < npts; ++i) {
+                    bp.vertices.push_back(Point{p->points[i].x,
+                                                p->points[i].y});
+                }
+                BITCODE_BL const seg_count =
+                    closed ? npts : (npts - 1);
+                bp.bulges.assign(seg_count, 0.0);
+                BITCODE_BL const nb =
+                    (p->num_bulges < seg_count) ? p->num_bulges : seg_count;
+                for (BITCODE_BL i = 0; i < nb; ++i) {
+                    bp.bulges[i] = p->bulges[i];
+                }
+                out.bulged_polylines.push_back(std::move(bp));
+            } else {
+                for (BITCODE_BL i = 1; i < npts; ++i) {
+                    auto const& a = p->points[i - 1];
+                    auto const& b = p->points[i];
+                    out.lines.push_back(
+                        Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
+                }
+                if (closed) {
+                    auto const& a = p->points[npts - 1];
+                    auto const& b = p->points[0];
+                    out.lines.push_back(
+                        Line{Point{a.x, a.y}, Point{b.x, b.y}, color});
+                }
             }
             ++out.polyline_count;
-            // Bulged segments (`p->bulges`, signed-tangent arcs between
-            // vertices) are treated as straight chords here; M5+ can
-            // sample them properly once the hit list of common DWG
-            // curves is fleshed out.
+            break;
+        }
+        case DWG_TYPE_ELLIPSE: {
+            auto const* e = obj->tio.entity->tio.ELLIPSE;
+            if (!e) { ++out.unknown_entities; break; }
+            // LibreDWG `sm_axis` is the vector from `center` to the
+            // major-axis endpoint (despite the historical "small axis"
+            // name — the field name is a LibreDWG legacy and does NOT
+            // refer to the minor axis). `axis_ratio` is the minor /
+            // major length ratio (≤ 1). `start_angle` / `end_angle`
+            // are parametric, not geometric.
+            out.ellipses.push_back(Ellipse{
+                Point{e->center.x, e->center.y},
+                Point{e->sm_axis.x, e->sm_axis.y},
+                e->axis_ratio,
+                e->start_angle,
+                e->end_angle,
+                resolve_color(obj->tio.entity),
+            });
+            ++out.ellipse_count;
             break;
         }
         default:
