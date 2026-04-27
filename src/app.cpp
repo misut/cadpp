@@ -106,16 +106,51 @@ void update(State& state, Msg msg) {
             phenotype::native::dialog::open_file("dwg", &on_picked);
         } else if constexpr (std::is_same_v<T, FileChosen>) {
             state.load(m.path);
+        } else if constexpr (std::is_same_v<T, Pan>) {
+            state.transform.pan(static_cast<double>(m.dx),
+                                static_cast<double>(m.dy));
+        } else if constexpr (std::is_same_v<T, Zoom>) {
+            state.transform.zoom_at(static_cast<double>(m.factor),
+                                    static_cast<double>(m.focus_x),
+                                    static_cast<double>(m.focus_y));
         }
     }, msg);
 }
+
+namespace {
+
+// Translate a phenotype `GestureEvent` (canvas-local coords already)
+// into cad++ Pan / Zoom messages, then post + repaint. Single hop —
+// phenotype delivers the event on the render thread, so post<Msg> is
+// safe here.
+void on_canvas_gesture(phenotype::GestureEvent const& ev) {
+    using K = phenotype::GestureKind;
+    switch (ev.kind) {
+    case K::Pan:
+        if (ev.dx != 0.0f || ev.dy != 0.0f) {
+            phenotype::detail::post<Msg>(Pan{ev.dx, ev.dy});
+            phenotype::detail::trigger_rebuild();
+        }
+        break;
+    case K::Pinch:
+    case K::ScrollZoom:
+        if (ev.pinch_scale != 1.0f) {
+            phenotype::detail::post<Msg>(
+                Zoom{ev.pinch_scale, ev.focus_x, ev.focus_y});
+            phenotype::detail::trigger_rebuild();
+        }
+        break;
+    }
+}
+
+} // namespace
 
 void view(State const& state) {
     using namespace phenotype;
     layout::padded(SpaceToken::Lg, [&] {
         layout::column([&] {
             widget::text("cad++", TextSize::Heading);
-            widget::text("M6d — file picker via phenotype platform_api",
+            widget::text("Slab 1 — pan / pinch-zoom on the drawing canvas",
                          TextSize::Small, TextColor::Muted);
             widget::button<Msg>("Open...", OpenRequested{},
                                 ButtonVariant::Primary);
@@ -124,9 +159,26 @@ void view(State const& state) {
             widget::code(format_summary(state.entities));
             widget::canvas(kCanvasWidth, kCanvasHeight,
                            [&state](Painter& p) {
+                // Frame the drawing region so the user can tell where
+                // the gesture-active surface starts and ends — without
+                // it the canvas blends into the page background.
+                // Stroked from the inside (offset by half-thickness)
+                // so the lines are not clipped by the canvas edge on
+                // backends that snap to pixel rows.
+                constexpr float kBorder = 2.0f;
+                constexpr Color kBorderColor{107, 114, 128, 255}; // theme.muted
+                float inset = kBorder * 0.5f;
+                float w = kCanvasWidth  - inset;
+                float h = kCanvasHeight - inset;
+                p.line(inset, inset, w,     inset, kBorder, kBorderColor);
+                p.line(w,     inset, w,     h,     kBorder, kBorderColor);
+                p.line(w,     h,     inset, h,     kBorder, kBorderColor);
+                p.line(inset, h,     inset, inset, kBorder, kBorderColor);
+
                 render_lines(p, state.entities, state.transform);
                 render_texts(p, state.entities, state.transform);
-            });
+            },
+                           &on_canvas_gesture);
         });
     });
 }
