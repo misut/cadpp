@@ -138,6 +138,30 @@ void render_paths(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform,
                   LayerVisibility const& visibility) {
+    // ---- SPLINE → MoveTo + LineTo polyline ----
+    //
+    // The parser pre-samples splines into a polyline (De Boor at
+    // uniform parameter steps for NURBS, fit-point passthrough for
+    // Bezier-scenario splines), so this path is just a polyline
+    // emit. Closed splines get a final `Close` verb.
+    for (auto const& sp : entities.splines) {
+        if (sp.points.size() < 2) continue;
+        if (!is_visible(visibility, sp.layer_name)) continue;
+        phenotype::PathBuilder pb;
+        auto const start = transform.apply(
+            sp.points[0].x, sp.points[0].y);
+        pb.move_to(static_cast<float>(start.x),
+                   static_cast<float>(start.y));
+        for (std::size_t i = 1; i < sp.points.size(); ++i) {
+            auto const c = transform.apply(
+                sp.points[i].x, sp.points[i].y);
+            pb.line_to(static_cast<float>(c.x),
+                       static_cast<float>(c.y));
+        }
+        if (sp.closed) pb.close();
+        p.stroke_path(pb, kLineThickness, to_paint(sp.color));
+    }
+
     // ---- Bulged LWPOLYLINE → MoveTo + (LineTo | ArcTo) chain ----
     for (auto const& bp : entities.bulged_polylines) {
         if (bp.vertices.size() < 2) continue;

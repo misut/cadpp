@@ -57,6 +57,8 @@ std::string format_summary(Entities const& e) {
            + std::to_string(e.circle_count)   + " circle(s), "
            + std::to_string(e.arc_count)      + " arc(s), "
            + std::to_string(e.polyline_count) + " polyline(s), "
+           + std::to_string(e.ellipse_count)  + " ellipse(s), "
+           + std::to_string(e.spline_count)   + " spline(s), "
            + std::to_string(e.text_count)     + " text(s)\n";
     out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";
     out += "Other entities (skipped): " + std::to_string(e.unknown_entities);

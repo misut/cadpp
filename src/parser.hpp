@@ -95,6 +95,26 @@ struct Ellipse {
     std::string layer_name;
 };
 
+// AutoCAD SPLINE entity (Slab 5). The DWG stores either control
+// points + a knot vector (NURBS scenario) or fit points (Bezier
+// scenario through interpolation points). The parser pre-samples
+// the curve into a polyline at parse time so the renderer just walks
+// `points` like any other line list. `closed` reflects the SPLINE's
+// `closed_b` / 2013+ `splineflags` close bit and triggers a final
+// `Close` verb in the path stream.
+//
+// Parse-time pre-sampling keeps the runtime renderer cheap (no De
+// Boor evaluation per frame) at the cost of zoom-out fidelity going
+// flat — splines lose their analytic smoothness at extreme zoom.
+// Real CAD viewers handle this the same way; the per-segment pixel
+// error caps out at ~0.5 px at the parse-time scale.
+struct Spline {
+    std::vector<Point> points;
+    bool               closed = false;
+    Color              color{};
+    std::string        layer_name;
+};
+
 // Slab 4 — DWG LAYER table entry. Drawing entities reference layers
 // either explicitly (the entity's `layer_name`) or implicitly (BYLAYER
 // colour fall-through). Frozen / off layers are normally hidden by the
@@ -129,6 +149,7 @@ struct Entities {
     std::vector<Arc>  arcs;        // CIRCLE + ARC, native arcs (no chord tessellation)
     std::vector<BulgedPolyline> bulged_polylines;  // LWPOLYLINE with any non-zero bulge
     std::vector<Ellipse> ellipses;                 // AutoCAD ELLIPSE entities
+    std::vector<Spline>  splines;                  // AutoCAD SPLINE entities (Slab 5)
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
 
     // Source-entity counts (before tessellation) so the summary card
@@ -138,6 +159,7 @@ struct Entities {
     unsigned int arc_count = 0;
     unsigned int polyline_count = 0;
     unsigned int ellipse_count = 0;
+    unsigned int spline_count = 0;
     unsigned int text_count = 0;
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
