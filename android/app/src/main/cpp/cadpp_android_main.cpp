@@ -31,6 +31,17 @@ void phenotype_android_detach_surface(void);
 void phenotype_android_draw_frame(void);
 void phenotype_android_start_app(void);
 void phenotype_android_install_runner(void (*runner)(void));
+// Stage 8: SAF dialog bridge. `jactivity` is the GameActivity java
+// instance (`app->activity->javaGameActivity`); phenotype walks its
+// class loader to resolve `class_name` (JNI internal form). Caches the
+// static methodID for `request_method` and binds `result_method` on
+// the same class to phenotype's internal native function via JNI
+// RegisterNatives. Must be called after `phenotype_android_bind_jvm`.
+void phenotype_android_install_file_dialog_handler(
+    void* jactivity,
+    char const* class_name,
+    char const* request_method,
+    char const* result_method);
 void phenotype_android_dispatch_pointer(float x, float y, int action);
 void phenotype_android_dispatch_key(int android_keycode, int action, int mods);
 void phenotype_android_dispatch_char(unsigned int codepoint);
@@ -181,6 +192,21 @@ extern "C" void android_main(android_app* app) {
     if (app->activity) {
         phenotype_android_bind_jvm(app->activity->vm);
         phenotype_android_bind_assets(app->activity->assetManager);
+    }
+
+    // SAF file picker bridge: cad++'s MainActivity exposes
+    // `openFileDialog(int, String)` (regular) and an `external`
+    // `onFileDialogResult(int, String?)` that phenotype binds to its
+    // own JNI native via RegisterNatives. The activity instance is
+    // required so phenotype can resolve the class through the app's
+    // class loader (the native thread's default loader only sees the
+    // system classpath, so a plain FindClass would miss MainActivity).
+    if (app->activity && app->activity->javaGameActivity) {
+        phenotype_android_install_file_dialog_handler(
+            app->activity->javaGameActivity,
+            "io/github/misut/cadpp/MainActivity",
+            "openFileDialog",
+            "onFileDialogResult");
     }
 
     // Order matters: stage the asset and publish its path BEFORE

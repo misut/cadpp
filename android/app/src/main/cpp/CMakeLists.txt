@@ -55,6 +55,15 @@ add_library(cadpp_android SHARED
     cadpp_android_main.cpp
 )
 
+# AGP defaults to `-Wl,--fatal-warnings`, which turns ld.lld's section-
+# group COMDAT-mismatch *warning* into a hard error when phenotype's
+# `inline` module-scope state (g_renderer, dialog state, …) is emitted
+# into both `libphenotype.a` *and* `libcadpp.a` (cadpp imports
+# `phenotype.native.android` from its Android entry point).
+# Deduplication still picks one prevailing copy at runtime — the
+# warning is benign here, so let it stay a warning.
+target_link_options(cadpp_android PRIVATE -Wl,--no-fatal-warnings)
+
 target_link_libraries(cadpp_android PRIVATE
     # --start-group lets the static archives resolve each other's
     # symbols regardless of command-line order. cadpp depends on
@@ -62,8 +71,14 @@ target_link_libraries(cadpp_android PRIVATE
     # the generated std module — without the group, the linker would
     # need a hand-tuned order that breaks every time exon adds a dep.
     -Wl,--start-group
-    cadpp_static
+    # Phenotype's archive must come before cadpp's so its inline
+    # module-scope state (`g_renderer`, dialog state, …) wins COMDAT
+    # tie-breaking. Otherwise ld.lld picks cadpp's transitively-emitted
+    # copy as prevailing while phenotype's `.init_array` still
+    # references its own discarded section, blowing up the link with
+    # "relocation refers to a discarded section".
     cadpp_phenotype_static
+    cadpp_static
     cadpp_cppx_static
     cadpp_txn_static
     cadpp_jsoncpp_static
