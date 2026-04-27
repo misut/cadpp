@@ -12,9 +12,8 @@ namespace cadpp {
 
 namespace {
 
-constexpr int    kCircleSegments = 64;
-constexpr double kPi             = 3.14159265358979323846;
-constexpr double kTwoPi          = 2.0 * kPi;
+constexpr double kPi    = 3.14159265358979323846;
+constexpr double kTwoPi = 2.0 * kPi;
 
 // LibreDWG color-method codes (Dwg_Color_Method in include/dwg.h).
 // Reproduced as integer constants here so we don't have to expose the
@@ -70,31 +69,6 @@ char const* version_string(unsigned int v) {
     }
 }
 
-// Sample the arc from (cx, cy, r) over [start_angle, end_angle] (in
-// radians, CCW per AutoCAD convention) into ~kCircleSegments segments
-// per full revolution. Number of segments scales with the arc span
-// so a small arc gets a proportionally small number of chords.
-void tessellate_arc(Entities& out, double cx, double cy, double r,
-                    double start_angle, double end_angle, Color color) {
-    double span = end_angle - start_angle;
-    if (span <= 0.0) span += kTwoPi;          // AutoCAD wraps modulo 2π
-    if (span > kTwoPi) span = kTwoPi;
-    int n = static_cast<int>(
-        std::ceil(static_cast<double>(kCircleSegments) * span / kTwoPi));
-    if (n < 1) n = 1;
-    double prev_x = cx + r * std::cos(start_angle);
-    double prev_y = cy + r * std::sin(start_angle);
-    for (int i = 1; i <= n; ++i) {
-        double t  = start_angle + span * static_cast<double>(i)
-                                       / static_cast<double>(n);
-        double nx = cx + r * std::cos(t);
-        double ny = cy + r * std::sin(t);
-        out.lines.push_back(Line{Point{prev_x, prev_y}, Point{nx, ny}, color});
-        prev_x = nx;
-        prev_y = ny;
-    }
-}
-
 void extract(Dwg_Object const* obj, Entities& out) {
     if (!obj) return;
     if (obj->supertype != DWG_SUPERTYPE_ENTITY) return;
@@ -116,17 +90,24 @@ void extract(Dwg_Object const* obj, Entities& out) {
         case DWG_TYPE_CIRCLE: {
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
-            tessellate_arc(out, c->center.x, c->center.y, c->radius,
-                           0.0, kTwoPi, resolve_color(obj->tio.entity));
+            out.arcs.push_back(Arc{
+                Point{c->center.x, c->center.y},
+                c->radius,
+                0.0, kTwoPi,
+                resolve_color(obj->tio.entity),
+            });
             ++out.circle_count;
             break;
         }
         case DWG_TYPE_ARC: {
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
-            tessellate_arc(out, a->center.x, a->center.y, a->radius,
-                           a->start_angle, a->end_angle,
-                           resolve_color(obj->tio.entity));
+            out.arcs.push_back(Arc{
+                Point{a->center.x, a->center.y},
+                a->radius,
+                a->start_angle, a->end_angle,
+                resolve_color(obj->tio.entity),
+            });
             ++out.arc_count;
             break;
         }

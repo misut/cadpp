@@ -43,6 +43,14 @@ inline BBox compute_bbox(Entities const& e) {
         b.add(t.position.x, t.position.y);
         b.add(t.position.x, t.position.y + t.height);
     }
+    // Conservative arc bbox: enclosing-circle (`center ± radius`).
+    // The exact bbox of a partial arc depends on which axis-aligned
+    // extrema fall inside the sweep, but the enclosing circle is
+    // safe — fit-on-load won't clip the arc — and cheap.
+    for (auto const& a : e.arcs) {
+        b.add(a.center.x - a.radius, a.center.y - a.radius);
+        b.add(a.center.x + a.radius, a.center.y + a.radius);
+    }
     return b;
 }
 

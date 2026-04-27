@@ -18,4 +18,8 @@ void render_texts(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform);
 
+void render_arcs(phenotype::Painter& p,
+                 Entities const& entities,
+                 ViewportTransform const& transform);
+
 } // namespace cadpp

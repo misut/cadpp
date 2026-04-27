@@ -48,4 +48,26 @@ void render_texts(phenotype::Painter& p,
     }
 }
 
+void render_arcs(phenotype::Painter& p,
+                 Entities const& entities,
+                 ViewportTransform const& transform) {
+    for (auto const& a : entities.arcs) {
+        auto const center_canvas = transform.apply(a.center.x, a.center.y);
+        float const r_px = static_cast<float>(a.radius * transform.scale);
+        if (r_px < 0.5f) continue;  // sub-pixel — skip
+        // CAD's angle convention is y-up CCW; phenotype's `Painter::arc`
+        // angle convention follows the canvas's y-down coordinate
+        // system (CCW around the canvas frame). Mirroring the angle
+        // across y reverses CCW into CW; swapping `start` and `end`
+        // restores the original sweep direction in the new frame.
+        float const canvas_start = static_cast<float>(-a.end_angle);
+        float const canvas_end   = static_cast<float>(-a.start_angle);
+        p.arc(static_cast<float>(center_canvas.x),
+              static_cast<float>(center_canvas.y),
+              r_px,
+              canvas_start, canvas_end,
+              kLineThickness, to_paint(a.color));
+    }
+}
+
 } // namespace cadpp
