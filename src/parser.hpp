@@ -161,6 +161,8 @@ struct Entities {
     unsigned int ellipse_count = 0;
     unsigned int spline_count = 0;
     unsigned int text_count = 0;
+    unsigned int insert_count = 0;     // Slab 5 — INSERT block instances expanded
+    unsigned int dimension_count = 0;  // Slab 5 — DIMENSION pre-rendered blocks expanded
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.

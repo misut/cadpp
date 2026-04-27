@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "parser.hpp"
+// `geom.hpp` carries the `Affine` type the Slab 5 INSERT / DIMENSION
+// expansion uses to flatten block-local coordinates into world space.
+#include "geom.hpp"
 
 extern "C" {
 #include <dwg.h>
@@ -171,29 +174,43 @@ char const* version_string(unsigned int v) {
     }
 }
 
-void extract(Dwg_Object const* obj, Entities& out) {
-    if (!obj) return;
+// Forward decl — the INSERT and DIMENSION cases recurse into block
+// children, which themselves dispatch back through this same switch.
+// Recursion is bounded because nested INSERTs eventually terminate at
+// a block of leaf primitives, and pathological cycles (an INSERT
+// reaching a block that ultimately contains the same INSERT again)
+// would only manifest in malformed DWGs.
+void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
+                       Affine const& xf, Entities& out);
 
-    // LAYER table entries arrive as DWG objects (not entities) — capture
-    // them so the panel UI can list / toggle them and so the renderer
-    // can already see the resolved colour on each entity that defers to
-    // BYLAYER.
-    if (obj->supertype == DWG_SUPERTYPE_OBJECT
-        && static_cast<int>(obj->fixedtype) == DWG_TYPE_LAYER) {
-        auto const* l = obj->tio.object->tio.LAYER;
-        if (l != nullptr && l->name != nullptr) {
-            out.layers.push_back(Layer{
-                std::string(l->name),
-                color_from_cmc(l->color),
-                l->frozen != 0,
-                l->off    != 0,
-            });
-        }
-        return;
+// Slab 5 — walk every entity owned by the BLOCK_HEADER referenced by
+// `block_ref`, dispatching each child through `extract_entity_xf` so
+// the inherited transform applies. Used by both `DWG_TYPE_INSERT`
+// (where `xf` is composed with the INSERT's own affine before this
+// call) and every `DWG_TYPE_DIMENSION_*` variant (whose `block`
+// holds a precomputed `*D###` anonymous block of dimension lines /
+// arcs / text and inherits `xf` verbatim — no extra transform).
+void expand_block(Dwg_Data* dwg, BITCODE_H block_ref,
+                  Affine const& xf, Entities& out) {
+    if (block_ref == nullptr) return;
+    Dwg_Object* block_obj = dwg_ref_object(dwg, block_ref);
+    if (block_obj == nullptr
+        || block_obj->supertype != DWG_SUPERTYPE_OBJECT) return;
+    auto const* bh = block_obj->tio.object->tio.BLOCK_HEADER;
+    if (bh == nullptr || bh->entities == nullptr) return;
+
+    for (BITCODE_BL i = 0; i < bh->num_owned; ++i) {
+        BITCODE_H href = bh->entities[i];
+        if (href == nullptr) continue;
+        Dwg_Object* child = dwg_ref_object(dwg, href);
+        if (child == nullptr) continue;
+        if (child->supertype != DWG_SUPERTYPE_ENTITY) continue;
+        extract_entity_xf(dwg, child, xf, out);
     }
+}
 
-    if (obj->supertype != DWG_SUPERTYPE_ENTITY) return;
-
+void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
+                       Affine const& xf, Entities& out) {
     auto const fixedtype = static_cast<int>(obj->fixedtype);
     switch (fixedtype) {
         case DWG_TYPE_LINE: {
@@ -201,8 +218,8 @@ void extract(Dwg_Object const* obj, Entities& out) {
             if (!line) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
             out.lines.push_back(Line{
-                Point{line->start.x, line->start.y},
-                Point{line->end.x,   line->end.y},
+                xf.apply_point(line->start.x, line->start.y),
+                xf.apply_point(line->end.x,   line->end.y),
                 meta.color,
                 std::move(meta.layer_name),
             });
@@ -213,10 +230,14 @@ void extract(Dwg_Object const* obj, Entities& out) {
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            // Circle is full sweep, so adding the affine's net rotation
+            // to start / end leaves the swept range == 2π — preserves
+            // the closed-circle invariant under any rotation.
+            double const rot = xf.rotation();
             out.arcs.push_back(Arc{
-                Point{c->center.x, c->center.y},
-                c->radius,
-                0.0, kTwoPi,
+                xf.apply_point(c->center.x, c->center.y),
+                c->radius * xf.scale_factor(),
+                rot, rot + kTwoPi,
                 meta.color,
                 std::move(meta.layer_name),
             });
@@ -227,10 +248,11 @@ void extract(Dwg_Object const* obj, Entities& out) {
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
+            double const rot = xf.rotation();
             out.arcs.push_back(Arc{
-                Point{a->center.x, a->center.y},
-                a->radius,
-                a->start_angle, a->end_angle,
+                xf.apply_point(a->center.x, a->center.y),
+                a->radius * xf.scale_factor(),
+                a->start_angle + rot, a->end_angle + rot,
                 meta.color,
                 std::move(meta.layer_name),
             });
@@ -242,8 +264,8 @@ void extract(Dwg_Object const* obj, Entities& out) {
             if (!t || !t->text_value) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
             out.texts.push_back(Text{
-                Point{t->ins_pt.x, t->ins_pt.y},
-                t->height,
+                xf.apply_point(t->ins_pt.x, t->ins_pt.y),
+                t->height * xf.scale_factor(),
                 std::string(t->text_value),
                 meta.color,
                 std::move(meta.layer_name),
@@ -256,8 +278,8 @@ void extract(Dwg_Object const* obj, Entities& out) {
             if (!m || !m->text) { ++out.unknown_entities; break; }
             auto meta = resolve_entity_metadata(obj->tio.entity);
             out.texts.push_back(Text{
-                Point{m->ins_pt.x, m->ins_pt.y},
-                m->text_height,
+                xf.apply_point(m->ins_pt.x, m->ins_pt.y),
+                m->text_height * xf.scale_factor(),
                 std::string(m->text),
                 meta.color,
                 std::move(meta.layer_name),
@@ -281,8 +303,7 @@ void extract(Dwg_Object const* obj, Entities& out) {
             // polyline routes through `Painter::stroke_path` so the
             // straight + arc segments stay one continuous, correctly-
             // joined entity. Polylines with all-zero bulges keep the
-            // legacy flat-line emit path — same wire output as before
-            // Slab 2.c.
+            // legacy flat-line emit path.
             bool any_bulge = false;
             if (p->bulges && p->num_bulges > 0) {
                 BITCODE_BL const nb =
@@ -299,8 +320,8 @@ void extract(Dwg_Object const* obj, Entities& out) {
                 bp.layer_name = layer_name;
                 bp.vertices.reserve(npts);
                 for (BITCODE_BL i = 0; i < npts; ++i) {
-                    bp.vertices.push_back(Point{p->points[i].x,
-                                                p->points[i].y});
+                    bp.vertices.push_back(
+                        xf.apply_point(p->points[i].x, p->points[i].y));
                 }
                 BITCODE_BL const seg_count =
                     closed ? npts : (npts - 1);
@@ -308,23 +329,29 @@ void extract(Dwg_Object const* obj, Entities& out) {
                 BITCODE_BL const nb =
                     (p->num_bulges < seg_count) ? p->num_bulges : seg_count;
                 for (BITCODE_BL i = 0; i < nb; ++i) {
+                    // Bulge value (= tan(θ/4)) is preserved under
+                    // similarity (rotate + uniform scale). Non-uniform
+                    // INSERT scale would distort the arc to an ellipse
+                    // arc — accepted approximation for now.
                     bp.bulges[i] = p->bulges[i];
                 }
                 out.bulged_polylines.push_back(std::move(bp));
             } else {
+                std::vector<Point> verts;
+                verts.reserve(npts);
+                for (BITCODE_BL i = 0; i < npts; ++i) {
+                    verts.push_back(
+                        xf.apply_point(p->points[i].x, p->points[i].y));
+                }
                 for (BITCODE_BL i = 1; i < npts; ++i) {
-                    auto const& a = p->points[i - 1];
-                    auto const& b = p->points[i];
                     out.lines.push_back(Line{
-                        Point{a.x, a.y}, Point{b.x, b.y},
+                        verts[i - 1], verts[i],
                         color, layer_name,
                     });
                 }
                 if (closed) {
-                    auto const& a = p->points[npts - 1];
-                    auto const& b = p->points[0];
                     out.lines.push_back(Line{
-                        Point{a.x, a.y}, Point{b.x, b.y},
+                        verts[npts - 1], verts[0],
                         color, layer_name,
                     });
                 }
@@ -341,10 +368,16 @@ void extract(Dwg_Object const* obj, Entities& out) {
             // refer to the minor axis). `axis_ratio` is the minor /
             // major length ratio (≤ 1). `start_angle` / `end_angle`
             // are parametric, not geometric.
+            //
+            // Centre transforms via `apply_point`; the major-axis
+            // vector via `apply_vector` (it's a vector from centre,
+            // not a world position). Minor ratio is preserved under
+            // similarity transforms; non-uniform INSERT scale would
+            // distort the ellipse — accepted approximation.
             auto meta = resolve_entity_metadata(obj->tio.entity);
             out.ellipses.push_back(Ellipse{
-                Point{e->center.x, e->center.y},
-                Point{e->sm_axis.x, e->sm_axis.y},
+                xf.apply_point(e->center.x, e->center.y),
+                xf.apply_vector(e->sm_axis.x, e->sm_axis.y),
                 e->axis_ratio,
                 e->start_angle,
                 e->end_angle,
@@ -381,17 +414,16 @@ void extract(Dwg_Object const* obj, Entities& out) {
             if (have_fit_pts) {
                 sp.points.reserve(s->num_fit_pts);
                 for (BITCODE_BS i = 0; i < s->num_fit_pts; ++i) {
-                    sp.points.push_back(
-                        Point{s->fit_pts[i].x, s->fit_pts[i].y});
+                    sp.points.push_back(xf.apply_point(
+                        s->fit_pts[i].x, s->fit_pts[i].y));
                 }
             } else if (s->num_ctrl_pts > 0 && s->ctrl_pts != nullptr
                        && s->num_knots >= static_cast<BITCODE_BL>(
                               s->num_ctrl_pts + degree + 1)
                        && s->knots != nullptr) {
-                // De Boor sample at uniform parameter steps. The 8-per-
-                // ctrl-pt heuristic (floored at 64) gives smooth output
-                // for typical CAD splines without going overboard on
-                // long control polygons.
+                // De Boor sample at uniform parameter steps in world
+                // coords first, then transform — keeps the De Boor
+                // evaluator transform-agnostic.
                 std::vector<Point> ctrl;
                 ctrl.reserve(s->num_ctrl_pts);
                 for (BITCODE_BL i = 0; i < s->num_ctrl_pts; ++i) {
@@ -416,12 +448,9 @@ void extract(Dwg_Object const* obj, Entities& out) {
                             + (t_max - t_min)
                                 * static_cast<double>(i)
                                 / static_cast<double>(samples);
-                        // Nudge the right boundary inside the last
-                        // knot span so the De Boor span search can't
-                        // overshoot.
                         if (i == samples) t = t_max - 1e-9;
-                        sp.points.push_back(
-                            de_boor(t, ctrl, knots, degree));
+                        Point const w = de_boor(t, ctrl, knots, degree);
+                        sp.points.push_back(xf.apply_point(w.x, w.y));
                     }
                 }
             }
@@ -434,10 +463,87 @@ void extract(Dwg_Object const* obj, Entities& out) {
             }
             break;
         }
+        case DWG_TYPE_INSERT: {
+            auto const* ins = obj->tio.entity->tio.INSERT;
+            if (!ins) { ++out.unknown_entities; break; }
+            // Build the INSERT's local affine — translate(ins_pt) ∘
+            // rotate(rotation) ∘ scale(scale.x, scale.y), in apply-
+            // order. Compose with the inherited `xf` so nested
+            // INSERTs accumulate correctly.
+            //
+            // MINSERT (rectangular array) is not handled here yet; it
+            // arrives as DWG_TYPE_MINSERT and will fall through to
+            // `default` (unknown_entities) in this PR.
+            Affine const local =
+                Affine::translate(ins->ins_pt.x, ins->ins_pt.y)
+                .compose(Affine::rotate(ins->rotation))
+                .compose(Affine::scale_xy(ins->scale.x, ins->scale.y));
+            Affine const child_xf = xf.compose(local);
+            expand_block(dwg, ins->block_header, child_xf, out);
+            ++out.insert_count;
+            break;
+        }
+        case DWG_TYPE_DIMENSION_ORDINATE:
+        case DWG_TYPE_DIMENSION_LINEAR:
+        case DWG_TYPE_DIMENSION_ALIGNED:
+        case DWG_TYPE_DIMENSION_ANG3PT:
+        case DWG_TYPE_DIMENSION_ANG2LN:
+        case DWG_TYPE_DIMENSION_RADIUS:
+        case DWG_TYPE_DIMENSION_DIAMETER: {
+            // Every DIMENSION_* variant carries a precomputed `*D###`
+            // anonymous block whose entities (lines / arcs / text +
+            // arrowheads) are already in world coordinates. Expand the
+            // block under the inherited `xf` — that's identity at top
+            // level, INSERT-composed when this DIMENSION lives inside
+            // a block.
+            //
+            // Every variant shares the `block` field through the
+            // DIMENSION_COMMON macro, so reading it through any one of
+            // the typed views works.
+            auto const* d = obj->tio.entity->tio.DIMENSION_LINEAR;
+            if (d == nullptr) { ++out.unknown_entities; break; }
+            expand_block(dwg, d->block, xf, out);
+            ++out.dimension_count;
+            break;
+        }
         default:
             ++out.unknown_entities;
             break;
     }
+}
+
+void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
+    if (!obj) return;
+
+    // LAYER table entries arrive as DWG objects (not entities) — capture
+    // them so the panel UI can list / toggle them and so the renderer
+    // can already see the resolved colour on each entity that defers to
+    // BYLAYER.
+    if (obj->supertype == DWG_SUPERTYPE_OBJECT
+        && static_cast<int>(obj->fixedtype) == DWG_TYPE_LAYER) {
+        auto const* l = obj->tio.object->tio.LAYER;
+        if (l != nullptr && l->name != nullptr) {
+            out.layers.push_back(Layer{
+                std::string(l->name),
+                color_from_cmc(l->color),
+                l->frozen != 0,
+                l->off    != 0,
+            });
+        }
+        return;
+    }
+
+    if (obj->supertype != DWG_SUPERTYPE_ENTITY) return;
+
+    // Slab 5 — Model-Space filter. Block-owned entities (entmode == 3)
+    // would otherwise render at their block-local coordinates,
+    // independent of any INSERT. They reach the renderer only via the
+    // INSERT case in `extract_entity_xf`, which composes the block's
+    // transform. Paper-Space (entmode == 1) is skipped for now —
+    // cad++ doesn't expose the plot view yet.
+    if (obj->tio.entity->entmode != 2 /* MSPACE */) return;
+
+    extract_entity_xf(dwg, obj, Affine::identity(), out);
 }
 
 } // namespace
@@ -458,7 +564,7 @@ Entities parse_file(std::string_view path) {
 
     auto const num_objects = dwg.num_objects;
     for (BITCODE_BL i = 0; i < num_objects; ++i) {
-        extract(&dwg.object[i], entities);
+        extract(&dwg, &dwg.object[i], entities);
     }
 
     dwg_free(&dwg);

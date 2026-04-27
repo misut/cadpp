@@ -54,6 +54,83 @@ inline BBox compute_bbox(Entities const& e) {
     return b;
 }
 
+// 2D affine transform (3×3 with implicit `[0 0 1]` last row). Used
+// for INSERT block expansion (Slab 5): the parser flattens block-
+// owned entities into the top-level entity vectors, applying the
+// INSERT's `ins_pt + rotation + scale` to every coordinate so the
+// renderer sees a single Model-Space entity stream — no recursion at
+// render time.
+//
+// `apply_point` translates AND rotates/scales; `apply_vector` only
+// rotates/scales (suitable for vectors-from-origin like an ellipse's
+// major-axis offset). `scale_factor()` returns the average linear
+// magnification — used for radius / font-height / line-thickness so
+// they grow with the block instance's scale.
+struct Affine {
+    double m00 = 1.0, m01 = 0.0, m02 = 0.0;  // row 0: m00*x + m01*y + m02
+    double m10 = 0.0, m11 = 1.0, m12 = 0.0;  // row 1
+
+    static Affine identity() { return Affine{}; }
+
+    static Affine translate(double tx, double ty) {
+        Affine a; a.m02 = tx; a.m12 = ty; return a;
+    }
+
+    static Affine scale_xy(double sx, double sy) {
+        Affine a; a.m00 = sx; a.m11 = sy; return a;
+    }
+
+    static Affine rotate(double angle) {
+        double const c = std::cos(angle);
+        double const s = std::sin(angle);
+        Affine a;
+        a.m00 =  c; a.m01 = -s;
+        a.m10 =  s; a.m11 =  c;
+        return a;
+    }
+
+    // `*this * rhs` — applies `rhs` first, then `*this`.
+    Affine compose(Affine const& rhs) const {
+        Affine r;
+        r.m00 = m00 * rhs.m00 + m01 * rhs.m10;
+        r.m01 = m00 * rhs.m01 + m01 * rhs.m11;
+        r.m02 = m00 * rhs.m02 + m01 * rhs.m12 + m02;
+        r.m10 = m10 * rhs.m00 + m11 * rhs.m10;
+        r.m11 = m10 * rhs.m01 + m11 * rhs.m11;
+        r.m12 = m10 * rhs.m02 + m11 * rhs.m12 + m12;
+        return r;
+    }
+
+    Point apply_point(double x, double y) const {
+        return Point{
+            m00 * x + m01 * y + m02,
+            m10 * x + m11 * y + m12,
+        };
+    }
+
+    Point apply_vector(double x, double y) const {
+        return Point{
+            m00 * x + m01 * y,
+            m10 * x + m11 * y,
+        };
+    }
+
+    // Average linear scaling. For uniform / similarity transforms this
+    // is the exact magnification; for non-uniform scales it's a stable
+    // scalar approximation suitable for radius / thickness / font-size
+    // adjustments.
+    double scale_factor() const {
+        double const sx = std::sqrt(m00 * m00 + m10 * m10);
+        double const sy = std::sqrt(m01 * m01 + m11 * m11);
+        return 0.5 * (sx + sy);
+    }
+
+    // Net rotation extracted from the upper-left 2×2. Stable for
+    // similarity transforms; for non-uniform scales it picks the
+    // x-axis direction.
+    double rotation() const { return std::atan2(m10, m00); }
+};
+
 // World-to-canvas transform. CAD's Y axis points up; canvas's Y axis
 // points down — apply() flips Y. Computed once at parse time and held
 // in State, so view() just looks values up.
