@@ -52,6 +52,38 @@ struct Arc {
     Color  color{};
 };
 
+// LWPOLYLINE with at least one non-zero `bulge` value. Each segment
+// from `vertices[i]` to `vertices[i + 1]` is a circular arc whose
+// arc-angle θ satisfies `bulge = tan(θ / 4)`; positive bulge sweeps
+// CCW (in CAD's y-up frame), negative sweeps CW. `bulges` has one
+// entry per segment (so size == vertices.size() - 1 for an open
+// polyline, or == vertices.size() for a closed one — the closing
+// segment's bulge is `bulges[vertices.size() - 1]`). A bulge of 0
+// degenerates to a straight chord.
+struct BulgedPolyline {
+    std::vector<Point>  vertices;
+    std::vector<double> bulges;
+    bool                closed = false;
+    Color               color{};
+};
+
+// AutoCAD ELLIPSE entity. `major_axis` is the vector (in CAD world
+// coords) from `center` to one endpoint of the major axis;
+// `minor_ratio` = |minor| / |major| ≤ 1. `start_param` / `end_param`
+// are parametric angles in radians (NOT geometric angles); the point
+// at parameter `t` is `center + major_axis · cos(t) + minor_axis · sin(t)`
+// where `minor_axis` is `major_axis` rotated 90° CCW and scaled by
+// `minor_ratio`. For a full ellipse, `start_param = 0`,
+// `end_param = 2π`.
+struct Ellipse {
+    Point  center;
+    Point  major_axis;
+    double minor_ratio = 1.0;
+    double start_param = 0.0;
+    double end_param   = 0.0;
+    Color  color{};
+};
+
 // Slab 2.a: parse a .dwg file into native draw primitives. CIRCLE
 // and ARC ride a dedicated `Arc` list (no parse-time chord
 // tessellation) so phenotype's `Painter::arc` rasterises them at
@@ -70,6 +102,8 @@ struct Entities {
     std::vector<Line> lines;       // raw + LWPOLYLINE chord segments
     std::vector<Text> texts;       // TEXT + MTEXT, untransformed CAD coords
     std::vector<Arc>  arcs;        // CIRCLE + ARC, native arcs (no chord tessellation)
+    std::vector<BulgedPolyline> bulged_polylines;  // LWPOLYLINE with any non-zero bulge
+    std::vector<Ellipse> ellipses;                 // AutoCAD ELLIPSE entities
 
     // Source-entity counts (before tessellation) so the summary card
     // can show what kinds of geometry came in.
@@ -77,6 +111,7 @@ struct Entities {
     unsigned int circle_count = 0;
     unsigned int arc_count = 0;
     unsigned int polyline_count = 0;
+    unsigned int ellipse_count = 0;
     unsigned int text_count = 0;
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that

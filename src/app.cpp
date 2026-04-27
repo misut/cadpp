@@ -191,6 +191,7 @@ void view(State const& state) {
 
                 render_lines(p, state.entities, state.transform);
                 render_arcs(p, state.entities, state.transform);
+                render_paths(p, state.entities, state.transform);
                 render_texts(p, state.entities, state.transform);
             },
                            &on_canvas_gesture);
