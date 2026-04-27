@@ -36,6 +36,7 @@ struct Line {
     Point b;
     Color color{};
     std::string layer_name;
+    float thickness = 1.0f;  // Slab 7 — pixels at canvas resolution
 };
 
 struct Text {
@@ -59,6 +60,7 @@ struct Arc {
     double end_angle   = 0.0;
     Color  color{};
     std::string layer_name;
+    float thickness = 1.0f;  // Slab 7 — pixels at canvas resolution
 };
 
 // LWPOLYLINE with at least one non-zero `bulge` value. Each segment
@@ -75,6 +77,7 @@ struct BulgedPolyline {
     bool                closed = false;
     Color               color{};
     std::string         layer_name;
+    float               thickness = 1.0f;  // Slab 7
 };
 
 // AutoCAD ELLIPSE entity. `major_axis` is the vector (in CAD world
@@ -93,6 +96,7 @@ struct Ellipse {
     double end_param   = 0.0;
     Color  color{};
     std::string layer_name;
+    float thickness = 1.0f;  // Slab 7
 };
 
 // AutoCAD SPLINE entity (Slab 5). The DWG stores either control
@@ -113,6 +117,7 @@ struct Spline {
     bool               closed = false;
     Color              color{};
     std::string        layer_name;
+    float              thickness = 1.0f;  // Slab 7
 };
 
 // AutoCAD HATCH entity (Slab 5). Each HATCH carries one or more
