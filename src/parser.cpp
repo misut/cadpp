@@ -9,6 +9,10 @@
 extern "C" {
 #include <dwg.h>
 #include <dwg_api.h>
+// Internal LibreDWG bit_convert_TU helper isn't in the public
+// dwg_api.h — declare it here. Converts UTF-16LE (BITCODE_TU) to a
+// freshly malloc'd UTF-8 string.
+char* bit_convert_TU(uint16_t const* wstr);
 }
 
 namespace cadpp {
@@ -80,13 +84,35 @@ struct EntityMetadata {
     std::string layer_name;
 };
 
-EntityMetadata resolve_entity_metadata(Dwg_Object_Entity const* ent) {
+// LibreDWG quirk: r2007+ DWG files store text fields as UTF-16LE
+// (`BITCODE_TU` = `uint16_t*`), but the struct member type is the
+// narrow `BITCODE_T` (= `char*`). The wide pointer is cast to char*
+// without conversion, so for ASCII text "AutoCAD" stored as UTF-16
+// (`41 00 75 00 ...`) `strlen()` returns 1 — the NUL high byte
+// terminates the C string after one character.
+//
+// Detect r2007+ on the parent dwg and run `bit_convert_TU` to get a
+// proper UTF-8 string. Caller owns the returned `std::string`.
+std::string read_text_field(Dwg_Data const* dwg, char const* raw) {
+    if (raw == nullptr) return {};
+    if (dwg != nullptr && dwg->header.version >= R_2007) {
+        char* utf8 = bit_convert_TU(reinterpret_cast<uint16_t const*>(raw));
+        if (utf8 == nullptr) return {};
+        std::string out{utf8};
+        std::free(utf8);
+        return out;
+    }
+    return std::string{raw};
+}
+
+EntityMetadata resolve_entity_metadata(Dwg_Data const* dwg,
+                                       Dwg_Object_Entity const* ent) {
     EntityMetadata out{};
     if (ent == nullptr) return out;
 
     Dwg_Object_LAYER* layer = dwg_get_entity_layer(ent);
     if (layer != nullptr && layer->name != nullptr) {
-        out.layer_name = layer->name;
+        out.layer_name = read_text_field(dwg, layer->name);
     }
 
     if (is_resolvable_cmc(ent->color)) {
@@ -139,7 +165,7 @@ std::vector<double> resolve_entity_dashes(
     // the line solid here; entity-side `BYLAYER` already fell through
     // to the layer's actual ltype above.
     if (lt->name != nullptr) {
-        std::string_view const n = lt->name;
+        std::string const n = read_text_field(dwg, lt->name);
         if (n == "Continuous" || n == "CONTINUOUS"
             || n == "ByLayer" || n == "BYLAYER"
             || n == "ByBlock" || n == "BYBLOCK") return {};
@@ -371,18 +397,27 @@ void decompose_dashed_line(Point a_world, Point b_world,
     }
 }
 
-// Slab 7 — DWG lineweight sentinel codes. Real values are mm × 100
-// (so 25 = 0.25mm, 50 = 0.50mm, etc.). Anything matching the three
-// sentinels below falls through to the layer's lineweight, then to
-// the cad++ default (1 px).
-constexpr int kLwByLayer = 28;
-constexpr int kLwByBlock = 29;
-constexpr int kLwDefault = 30;
-
 // Slab 7 — resolve an entity's effective lineweight in canvas pixels.
 //
-// Maps the DWG lineweight value (in 0.01 mm units) to a stroke
-// thickness via a flat 0.05 px-per-unit factor with a 1 px floor.
+// `linewt` is a 0..31 enum index (NOT the raw 0.01 mm value);
+// LibreDWG exposes `dxf_cvt_lweight()` to translate the index into
+// either an actual `0.01 mm` lineweight (0..211) or one of the
+// BYLAYER (-1) / BYBLOCK (-2) / BYLWDEFAULT (-3) sentinels. Earlier
+// builds of this helper treated the raw byte as if it were already
+// in mm-x100 — every line ended up at the 1 px floor regardless of
+// the file's metadata. The conversion below now goes through the
+// LibreDWG helper so files like Autodesk's `lineweights.dwg` show
+// the expected hierarchy.
+//
+// 0.05 px per 0.01 mm with a 1 px floor maps the standard CAD
+// weights into a clear visual hierarchy:
+//
+//   0.13 mm (lw idx  3 → 13)  → 1.0 px
+//   0.25 mm (lw idx  7 → 25)  → 1.25 px
+//   0.50 mm (lw idx 11 → 50)  → 2.5 px
+//   0.70 mm (lw idx 14 → 70)  → 3.5 px
+//   1.00 mm (lw idx 17 → 100) → 5.0 px
+//
 // Lineweight stays pixel-frame, not world-frame — strokes keep a
 // constant on-screen weight at any zoom, matching every CAD viewer's
 // "lineweight display" mode.
@@ -390,20 +425,23 @@ constexpr int kLwDefault = 30;
 // Resolution order: entity own `linewt` → layer `linewt` (BYLAYER /
 // BYBLOCK / DEFAULT fallback) → 1 px default.
 float resolve_entity_lineweight_px(Dwg_Object_Entity const* ent) {
-    constexpr float kDefaultPx   = 1.0f;
-    constexpr float kPxPerLinewt = 0.05f;
+    constexpr float kDefaultPx        = 1.0f;
+    constexpr float kPxPerHundredthMm = 0.05f;
 
-    auto cvt = [&](int lw) -> std::optional<float> {
-        if (lw == kLwByLayer || lw == kLwByBlock || lw == kLwDefault) {
-            return std::nullopt;
-        }
-        if (lw < 0 || lw > 211) return std::nullopt;
-        return std::max(1.0f, static_cast<float>(lw) * kPxPerLinewt);
+    auto cvt = [&](int raw_byte) -> std::optional<float> {
+        // dxf_cvt_lweight masks with `% 32` internally so any byte is
+        // safe. Negative return values flag the sentinels — caller
+        // then falls through to the next resolution level.
+        int const mm100 = dxf_cvt_lweight(
+            static_cast<BITCODE_BSd>(raw_byte));
+        if (mm100 < 0) return std::nullopt;
+        if (mm100 == 0) return std::nullopt;  // 0 mm = use default
+        return std::max(
+            1.0f, static_cast<float>(mm100) * kPxPerHundredthMm);
     };
 
     if (ent == nullptr) return kDefaultPx;
-    int const ent_lw = static_cast<int>(ent->linewt);
-    if (auto v = cvt(ent_lw)) return *v;
+    if (auto v = cvt(static_cast<int>(ent->linewt))) return *v;
 
     Dwg_Object_LAYER* layer = dwg_get_entity_layer(ent);
     if (layer != nullptr) {
@@ -527,7 +565,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_LINE: {
             auto const* line = obj->tio.entity->tio.LINE;
             if (!line) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -554,7 +592,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_CIRCLE: {
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -590,7 +628,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_ARC: {
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -621,13 +659,48 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_TEXT: {
             auto const* t = obj->tio.entity->tio.TEXT;
             if (!t || !t->text_value) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            // DWG TEXT carries two anchor points: `ins_pt` (the
+            // baseline-left for the default Left/Baseline alignment)
+            // and `alignment_pt` (used when horiz_alignment != 0 or
+            // vert_alignment != 0 — the actual anchor depends on the
+            // chosen mode). Per LibreDWG, `alignment_pt` is populated
+            // when `dataflags & 2`.
+            int const h_align = static_cast<int>(t->horiz_alignment);
+            int const v_align = static_cast<int>(t->vert_alignment);
+            // LibreDWG dataflags bit 1 is INVERTED: clear (= 0) means
+            // `alignment_pt` is present in the wire format. See
+            // `dwg.spec`: `if (!(dataflags & 0x02)) FIELD_2DD
+            // (alignment_pt, ins_pt, 0);`. We use `alignment_pt`
+            // whenever it's populated AND the entity declares a non-
+            // default H/V alignment — otherwise the default Left /
+            // Baseline anchor at `ins_pt` is the correct anchor.
+            bool const has_align_pt = (t->dataflags & 0x2) == 0;
+            Point const anchor = (has_align_pt
+                                  && (h_align != 0 || v_align != 0))
+                ? Point{t->alignment_pt.x, t->alignment_pt.y}
+                : Point{t->ins_pt.x, t->ins_pt.y};
+            // Aligned (3) / Fit (5) need the second alignment point
+            // and would shrink the text to fit; until phenotype text
+            // measurement is wired in, fall those back to Left so we
+            // at least show the text in a reasonable position.
+            TextHAlign const ha =
+                (h_align == 1) ? TextHAlign::Center :
+                (h_align == 2) ? TextHAlign::Right  :
+                (h_align == 4) ? TextHAlign::Middle :
+                                 TextHAlign::Left;
+            TextVAlign const va =
+                (v_align == 1) ? TextVAlign::Bottom :
+                (v_align == 2) ? TextVAlign::Middle :
+                (v_align == 3) ? TextVAlign::Top    :
+                                 TextVAlign::Baseline;
             out.texts.push_back(Text{
-                xf.apply_point(t->ins_pt.x, t->ins_pt.y),
+                xf.apply_point(anchor.x, anchor.y),
                 t->height * xf.scale_factor(),
-                std::string(t->text_value),
+                read_text_field(dwg, t->text_value),
                 meta.color,
                 std::move(meta.layer_name),
+                ha, va,
             });
             ++out.text_count;
             break;
@@ -635,13 +708,29 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_MTEXT: {
             auto const* m = obj->tio.entity->tio.MTEXT;
             if (!m || !m->text) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            // MTEXT `attachment` enum picks the corner the
+            // ins_pt anchors at (1=top-left, 2=top-centre, 3=top-
+            // right, 4=middle-left, 5=middle-centre, 6=middle-right,
+            // 7=bottom-left, 8=bottom-centre, 9=bottom-right). Decode
+            // into separate H/V anchors so the renderer applies the
+            // same offset logic as for plain TEXT.
+            int const att = static_cast<int>(m->attachment);
+            TextHAlign const ha =
+                (att == 2 || att == 5 || att == 8) ? TextHAlign::Center :
+                (att == 3 || att == 6 || att == 9) ? TextHAlign::Right  :
+                                                     TextHAlign::Left;
+            TextVAlign const va =
+                (att == 1 || att == 2 || att == 3) ? TextVAlign::Top    :
+                (att == 4 || att == 5 || att == 6) ? TextVAlign::Middle :
+                                                     TextVAlign::Bottom;
             out.texts.push_back(Text{
                 xf.apply_point(m->ins_pt.x, m->ins_pt.y),
                 m->text_height * xf.scale_factor(),
-                std::string(m->text),
+                read_text_field(dwg, m->text),
                 meta.color,
                 std::move(meta.layer_name),
+                ha, va,
             });
             ++out.text_count;
             break;
@@ -651,7 +740,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             if (!p || !p->points || p->num_points < 2) {
                 ++out.unknown_entities; break;
             }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             Color const color = meta.color;
@@ -754,7 +843,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // not a world position). Minor ratio is preserved under
             // similarity transforms; non-uniform INSERT scale would
             // distort the ellipse — accepted approximation.
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -793,7 +882,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_SPLINE: {
             auto const* s = obj->tio.entity->tio.SPLINE;
             if (!s) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             Spline sp{};
             sp.color      = meta.color;
             sp.layer_name = std::move(meta.layer_name);
@@ -952,7 +1041,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             if (!h || h->num_paths == 0 || h->paths == nullptr) {
                 ++out.unknown_entities; break;
             }
-            auto meta = resolve_entity_metadata(obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
             Hatch hatch{};
             hatch.color      = meta.color;
             hatch.layer_name = std::move(meta.layer_name);
@@ -1111,7 +1200,7 @@ void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
         auto const* l = obj->tio.object->tio.LAYER;
         if (l != nullptr && l->name != nullptr) {
             out.layers.push_back(Layer{
-                std::string(l->name),
+                read_text_field(dwg, l->name),
                 color_from_cmc(l->color),
                 l->frozen != 0,
                 l->off    != 0,
@@ -1129,7 +1218,7 @@ void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
         auto const* lt = obj->tio.object->tio.LTYPE;
         if (lt != nullptr && lt->name != nullptr) {
             Linetype line_type{};
-            line_type.name = lt->name;
+            line_type.name = read_text_field(dwg, lt->name);
             if (lt->dashes != nullptr) {
                 line_type.dashes.reserve(lt->numdashes);
                 for (BITCODE_RC i = 0; i < lt->numdashes; ++i) {
