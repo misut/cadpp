@@ -39,12 +39,32 @@ struct Line {
     float thickness = 1.0f;  // Slab 7 — pixels at canvas resolution
 };
 
+// Horizontal text anchor (matches DWG TEXT::horiz_alignment, modulo
+// the Aligned / Fit modes which we treat as Left for now — they need
+// width measurement we don't have).
+enum class TextHAlign : std::uint8_t {
+    Left   = 0,  // anchor = baseline-left
+    Center = 1,  // anchor = baseline-centre
+    Right  = 2,  // anchor = baseline-right
+    Middle = 4,  // anchor = visual-centre (Mid for both axes)
+};
+
+// Vertical text anchor (matches DWG TEXT::vert_alignment).
+enum class TextVAlign : std::uint8_t {
+    Baseline = 0,
+    Bottom   = 1,
+    Middle   = 2,
+    Top      = 3,
+};
+
 struct Text {
-    Point position;        // CAD coords (insertion point — top-left for TEXT)
+    Point position;        // CAD coords — anchor point per (h_align, v_align)
     double height = 0.0;   // CAD units (font height in world space)
     std::string content;   // UTF-8 (LibreDWG normalises wide strings on read)
     Color color{};
     std::string layer_name;
+    TextHAlign h_align = TextHAlign::Left;
+    TextVAlign v_align = TextVAlign::Baseline;
 };
 
 // CIRCLE and ARC entities, kept as native arcs so the renderer can

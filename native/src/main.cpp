@@ -19,5 +19,5 @@ int main(int argc, char** argv) {
         cadpp::g_dwg_path = argv[1];
     }
     return phenotype::native::run_app<cadpp::State, cadpp::Msg>(
-        900, 800, "cad++", cadpp::view, cadpp::update);
+        1400, 1000, "cad++", cadpp::view, cadpp::update);
 }

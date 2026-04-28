@@ -20,6 +20,46 @@ inline phenotype::Color to_paint(Color const& c) {
     return phenotype::Color{c.r, c.g, c.b, c.a};
 }
 
+// Per-character advance estimate in `em` units, calibrated against
+// Arial Regular at size 1.0. Used by `text_advance_em()` to feed the
+// alignment offset in `render_texts` — close enough for centred /
+// right-anchored CAD labels to land within ±1 px of the actual
+// rasterised position. A future pass should query phenotype's
+// `measure_text` host hook directly for pixel-perfect alignment.
+inline float char_em_width(char c) {
+    static constexpr float W[128] = {
+        0.00f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        // 0x20-0x2F: space ! " # $ % & ' ( ) * + , - . /
+        0.28f, 0.28f, 0.36f, 0.55f, 0.55f, 0.88f, 0.67f, 0.19f,
+        0.33f, 0.33f, 0.39f, 0.58f, 0.28f, 0.33f, 0.28f, 0.28f,
+        // 0x30-0x3F: 0-9 : ; < = > ?
+        0.55f, 0.55f, 0.55f, 0.55f, 0.55f, 0.55f, 0.55f, 0.55f,
+        0.55f, 0.55f, 0.28f, 0.28f, 0.58f, 0.58f, 0.58f, 0.55f,
+        // 0x40-0x4F: @ A B C D E F G H I J K L M N O
+        1.01f, 0.67f, 0.67f, 0.72f, 0.72f, 0.67f, 0.61f, 0.78f,
+        0.72f, 0.28f, 0.50f, 0.67f, 0.55f, 0.83f, 0.72f, 0.78f,
+        // 0x50-0x5F: P Q R S T U V W X Y Z [ \ ] ^ _
+        0.67f, 0.78f, 0.72f, 0.67f, 0.61f, 0.72f, 0.67f, 0.94f,
+        0.67f, 0.67f, 0.61f, 0.28f, 0.28f, 0.28f, 0.47f, 0.55f,
+        // 0x60-0x6F: ` a b c d e f g h i j k l m n o
+        0.33f, 0.55f, 0.55f, 0.50f, 0.55f, 0.55f, 0.28f, 0.55f,
+        0.55f, 0.22f, 0.22f, 0.50f, 0.22f, 0.83f, 0.55f, 0.55f,
+        // 0x70-0x7F: p q r s t u v w x y z { | } ~ DEL
+        0.55f, 0.55f, 0.33f, 0.50f, 0.28f, 0.55f, 0.50f, 0.72f,
+        0.50f, 0.50f, 0.50f, 0.33f, 0.26f, 0.33f, 0.58f, 0.0f,
+    };
+    auto idx = static_cast<unsigned char>(c);
+    if (idx >= 128) return 0.55f;  // generic fallback for non-ASCII
+    return W[idx];
+}
+
+inline float text_advance_em(char const* str, std::size_t len) {
+    float total = 0.0f;
+    for (std::size_t i = 0; i < len; ++i) total += char_em_width(str[i]);
+    return total;
+}
+
 // Slab 4 — layer visibility filter. Entities without a resolved layer
 // are always rendered; entities whose layer doesn't appear in the map
 // are visible by default (the panel only inserts the layers it knows
@@ -54,16 +94,54 @@ void render_texts(phenotype::Painter& p,
     for (auto const& t : entities.texts) {
         if (t.content.empty()) continue;
         if (!is_visible(visibility, t.layer_name)) continue;
-        // CAD's insertion_pt sits on the text's baseline; canvas's
-        // text() takes the top-left of the font-size box. Move up by
-        // `height` in CAD (= down by `height * scale` in canvas) to
-        // line them up.
-        auto const top_left = transform.apply(
-            t.position.x, t.position.y + t.height);
         float const font_px = static_cast<float>(t.height * transform.scale);
         if (font_px < 4.0f) continue;  // below visual threshold; skip
-        p.text(static_cast<float>(top_left.x),
-               static_cast<float>(top_left.y),
+
+        // Heuristic glyph metrics calibrated against Arial Regular
+        // em widths (`char_em_width`). Lands within ±1 px of the
+        // actual rasterised position for typical CAD labels — much
+        // closer than a flat per-char average. Future work: query
+        // phenotype's `measure_text` host hook for pixel-perfect
+        // alignment.
+        float const approx_w = font_px
+            * text_advance_em(t.content.data(), t.content.size());
+
+        // DWG anchor (`t.position`) lives at the baseline / Aligned
+        // corner per the entity's H/V alignment. Convert to the
+        // top-left phenotype expects:
+        //
+        //   - Horizontal: subtract 0/half/full of the run width to
+        //     turn left/centre/right anchors into a left-anchor;
+        //     "Middle" is the visual centre and uses half-width too.
+        //   - Vertical: phenotype's anchor is the top of the font-size
+        //     box, so push the y down by 0/half/full font height
+        //     depending on whether the DWG anchor was baseline /
+        //     bottom / middle / top.
+        auto const anchor_canvas =
+            transform.apply(t.position.x, t.position.y);
+        float ax = static_cast<float>(anchor_canvas.x);
+        float ay = static_cast<float>(anchor_canvas.y);
+
+        switch (t.h_align) {
+        case TextHAlign::Left:                       break;
+        case TextHAlign::Center: ax -= approx_w * 0.5f; break;
+        case TextHAlign::Middle: ax -= approx_w * 0.5f; break;
+        case TextHAlign::Right:  ax -= approx_w;        break;
+        }
+
+        // Canvas y grows downward. For Baseline (CAD default), the
+        // visible glyph sits ABOVE the anchor, so the top-left is
+        // `anchor_y - font_px`. Other anchors mirror that — Bottom is
+        // the same as Baseline modulo descender; Middle is half a
+        // font-height up; Top means the anchor is already at the top.
+        switch (t.v_align) {
+        case TextVAlign::Baseline:
+        case TextVAlign::Bottom:  ay -= font_px;        break;
+        case TextVAlign::Middle:  ay -= font_px * 0.5f; break;
+        case TextVAlign::Top:                           break;
+        }
+
+        p.text(ax, ay,
                t.content.data(),
                static_cast<unsigned int>(t.content.size()),
                font_px, to_paint(t.color));

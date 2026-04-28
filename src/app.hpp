@@ -25,14 +25,19 @@ namespace cadpp {
 extern std::string g_dwg_path;
 
 // Canvas size doubles on Android because phenotype's surface is
-// 1:1 with physical pixels — at the desktop's 800×500 a phone screen
-// would only fill the top 30% with a hard-to-see drawing.
+// 1:1 with physical pixels — a 1080×2400 phone would only fill the
+// top sliver with a desktop-default-sized canvas.
+//
+// Desktop default targets a 1400×1000 GLFW window (set in
+// native/src/main.cpp); the canvas is sized so the layer panel +
+// summary card on the left and the canvas on the right both fit
+// comfortably without horizontal scrolling.
 #ifdef __ANDROID__
 constexpr float kCanvasWidth  = 1000.0f;
 constexpr float kCanvasHeight = 900.0f;
 #else
-constexpr float kCanvasWidth  = 800.0f;
-constexpr float kCanvasHeight = 500.0f;
+constexpr float kCanvasWidth  = 1200.0f;
+constexpr float kCanvasHeight = 800.0f;
 #endif
 
 std::string format_summary(Entities const& e);
