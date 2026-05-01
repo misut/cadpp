@@ -240,6 +240,35 @@ struct Layout {
 // POLYLINE_2D / POLYLINE_3D (vertices via handle lists), text
 // rotation, and remaining per-entity styling (layer, weight) are
 // still deferred.
+// VIEWPORT clip marker (Slab 9). Each `expand_viewport` walk emits
+// one Push marker before pulling the model BLOCK_HEADER through the
+// viewport's affine and one matching Pop marker after. The renderer
+// walks the marker stream alongside each entity vector and issues
+// `Painter::push_clip` / `pop_clip` so model content drawn under the
+// transform stays inside the viewport's paper-space rectangle.
+//
+// The `*_idx` fields record the entity index at which the marker
+// takes effect for each per-type vector. Each render function
+// advances a private cursor through `clip_markers` and consults only
+// its own `*_idx` field, so the same marker stream serves all
+// entity-type render passes without per-type duplication.
+//
+// `x / y / w / h` are in paper-space CAD coordinates. The renderer
+// applies the active `ViewportTransform` to project them into canvas
+// pixels right before emitting the Painter clip call.
+struct ClipMarker {
+    enum class Kind : std::uint8_t { Push, Pop };
+    Kind   kind = Kind::Push;
+    double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+    std::size_t lines_idx    = 0;
+    std::size_t arcs_idx     = 0;
+    std::size_t bulged_idx   = 0;
+    std::size_t ellipses_idx = 0;
+    std::size_t splines_idx  = 0;
+    std::size_t hatches_idx  = 0;
+    std::size_t texts_idx    = 0;
+};
+
 struct Entities {
     bool ok = false;
     std::string error;             // populated when ok == false
@@ -255,6 +284,9 @@ struct Entities {
     std::vector<Linetype> linetypes;               // DWG LTYPE table (Slab 7)
     std::vector<Style>   styles;                   // DWG STYLE table (Slab 8 — fonts)
     std::vector<Layout>  layouts;                  // DWG LAYOUT table — user-selectable views
+    // Slab 9 — VIEWPORT clip stream. Empty when no paper-space sheet
+    // with decoded VIEWPORTs was selected.
+    std::vector<ClipMarker> clip_markers;
 
     // Source-entity counts (before tessellation) so the summary card
     // can show what kinds of geometry came in.
@@ -272,6 +304,7 @@ struct Entities {
     unsigned int linetype_count = 0;   // Slab 7 — LTYPE table entries captured
     unsigned int style_count = 0;      // Slab 8 — STYLE table entries captured
     unsigned int layout_count = 0;     // DWG LAYOUT objects captured
+    unsigned int viewport_count = 0;   // Slab 9 — VIEWPORT entities expanded
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.

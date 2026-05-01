@@ -703,6 +703,81 @@ void expand_block(Dwg_Data* dwg, BITCODE_H block_ref,
     }
 }
 
+// Slab 9 — record current per-vector entity counts so the renderer can
+// issue Painter::push_clip / pop_clip exactly when it reaches the
+// entity index where the marker was emitted.
+void emit_clip_marker(Entities& out, ClipMarker::Kind kind,
+                      double x, double y, double w, double h) {
+    out.clip_markers.push_back({
+        kind, x, y, w, h,
+        out.lines.size(), out.arcs.size(),
+        out.bulged_polylines.size(), out.ellipses.size(),
+        out.splines.size(), out.hatches.size(), out.texts.size(),
+    });
+}
+
+// Slab 9 — walk a paper-space VIEWPORT entity: emit a clip-push marker
+// for the viewport's paper-space rectangle, recurse through the
+// model-space BLOCK_HEADER under the viewport's affine, then emit a
+// matching clip-pop. Mirrors `expand_block` in shape — only the
+// transform composition + clip markers differ.
+//
+// Affine composition (model → paper):
+//     T(model_pt) = vp.center + scale * Rot(twist) * (model_pt - VIEWCTR)
+// where `scale = vp.height / vp.VIEWSIZE` (VIEWSIZE is the model-space
+// height visible inside the viewport, vp.height is its paper-space
+// height — `width / VIEWSIZE` is incorrect even though `width / height`
+// usually matches the model's aspect, because non-square viewports
+// would skew the model otherwise). `vp.center` and `vp.width/height`
+// are paper-space CAD coordinates.
+//
+// Skips: off-state viewports (`on_off == 0`), the implicit "overall"
+// paper-space viewport (id == 1, sized to the sheet itself), and
+// degenerate / zero-extent rectangles. 3D viewports
+// (`VIEWDIR != (0,0,1)`) are rendered as 2D — flagged in the slab's
+// PR body as a known limitation.
+void expand_viewport(Dwg_Data* dwg,
+                     Dwg_Entity_VIEWPORT const* vp,
+                     Dwg_Object_BLOCK_HEADER const* model_bh,
+                     Affine const& parent_xf, Entities& out) {
+    if (vp == nullptr || model_bh == nullptr) return;
+    if (vp->on_off == 0) return;
+    // The `overall` VIEWPORT (id 1) defines the page itself — not a
+    // model-content viewport. Each Sheet has exactly one of these.
+    if (vp->id == 1) return;
+    if (vp->width <= 0.0 || vp->height <= 0.0) return;
+    if (vp->VIEWSIZE <= 0.0) return;
+
+    double const scale = vp->height / vp->VIEWSIZE;
+
+    Affine const local =
+        Affine::translate(vp->center.x, vp->center.y)
+            .compose(Affine::scale_xy(scale, scale))
+            .compose(Affine::rotate(vp->twist_angle))
+            .compose(Affine::translate(-vp->VIEWCTR.x, -vp->VIEWCTR.y));
+    Affine const viewport_xf = parent_xf.compose(local);
+
+    // Paper-space rect: AutoCAD stores `center + width/height`.
+    double const rect_x = vp->center.x - vp->width  * 0.5;
+    double const rect_y = vp->center.y - vp->height * 0.5;
+    emit_clip_marker(out, ClipMarker::Kind::Push,
+                     rect_x, rect_y, vp->width, vp->height);
+
+    if (model_bh->entities != nullptr) {
+        for (BITCODE_BL i = 0; i < model_bh->num_owned; ++i) {
+            BITCODE_H href = model_bh->entities[i];
+            if (href == nullptr) continue;
+            Dwg_Object* child = dwg_ref_object(dwg, href);
+            if (child == nullptr) continue;
+            if (child->supertype != DWG_SUPERTYPE_ENTITY) continue;
+            extract_entity_xf(dwg, child, viewport_xf, out);
+        }
+    }
+
+    emit_clip_marker(out, ClipMarker::Kind::Pop, 0.0, 0.0, 0.0, 0.0);
+    ++out.viewport_count;
+}
+
 void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                        Affine const& xf, Entities& out) {
     auto const fixedtype = static_cast<int>(obj->fixedtype);
@@ -1367,6 +1442,15 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             }
             break;
         }
+        // Slab 9 — VIEWPORT entities are walked through `expand_viewport`
+        // from the pass-2 paper-space sheet loop with the model
+        // BLOCK_HEADER + per-viewport affine. They never reach the
+        // generic entity dispatch via this switch (paper-space sheets
+        // only enumerate VIEWPORTs from their own block-header), but
+        // recurring through nested INSERTs inside a paper-space block
+        // can land here. Drop silently rather than counting as unknown.
+        case DWG_TYPE_VIEWPORT:
+            break;
         default:
             ++out.unknown_entities;
             break;
@@ -1590,13 +1674,41 @@ Entities parse_file(std::string_view path,
         if (selected_bh != nullptr) {
             extract_layout_entities(&dwg, selected_bh, entities);
         }
-        // For non-Model sheets, layer the Model-space content on top
-        // (or under, since render order is hatches→lines→arcs→etc.,
-        // independent of extraction order). The sheet's own paper-
-        // space decorations (title block etc.) ride along too.
-        if (!selected->is_model && model_bh != nullptr
-            && model_bh != selected_bh) {
-            extract_layout_entities(&dwg, model_bh, entities);
+        // Slab 9 — VIEWPORT-driven sheet rendering. For paper-space
+        // sheets, instead of layering the Model BLOCK_HEADER walk on
+        // top (the Slab-21 walk-both approximation), enumerate the
+        // sheet's own VIEWPORT entities and pull model content
+        // through each one's affine + clip rect. Replaces the prior
+        // walk-both behaviour that made Sheets render the same drawing
+        // as Model with the title block on top, with Autodesk Viewer's
+        // actual sheet behaviour (model content scaled + clipped per
+        // viewport).
+        //
+        // Falls back to the walk-both interim only when no VIEWPORTs
+        // were processed AND a Model block-header is available — covers
+        // files we haven't audited where LibreDWG fails to expose any
+        // decodable VIEWPORT inside the sheet's block-header.
+        if (!selected->is_model && selected_bh != nullptr
+            && model_bh != nullptr && model_bh != selected_bh) {
+            unsigned int const before = entities.viewport_count;
+            for (BITCODE_BL i = 0; i < selected_bh->num_owned; ++i) {
+                BITCODE_H href = selected_bh->entities[i];
+                if (href == nullptr) continue;
+                Dwg_Object* eobj = dwg_ref_object(&dwg, href);
+                if (eobj == nullptr) continue;
+                if (eobj->supertype != DWG_SUPERTYPE_ENTITY) continue;
+                if (static_cast<int>(eobj->fixedtype)
+                    != DWG_TYPE_VIEWPORT) continue;
+                auto const* vp = eobj->tio.entity->tio.VIEWPORT;
+                expand_viewport(&dwg, vp, model_bh,
+                                Affine::identity(), entities);
+            }
+            // Walk-both fallback: only when zero VIEWPORTs were
+            // expanded for the sheet (none decoded, all skipped, or
+            // sheet truly has no viewports).
+            if (entities.viewport_count == before) {
+                extract_layout_entities(&dwg, model_bh, entities);
+            }
         }
     } else {
         // Fallback path — preserve pre-slab behaviour.
