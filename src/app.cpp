@@ -71,9 +71,39 @@ std::string format_summary(Entities const& e) {
     return out;
 }
 
-void State::load(std::string path) {
+// Autodesk Viewer suppresses lineweight rendering in the Model layout
+// (the "2D View" pane), independent of the file's LWDISPLAY header
+// variable. Sheets render lineweight through their plot setup. cad++
+// matches that convention by collapsing every entity's per-entity
+// lineweight to the 1.0 px default when the active layout is Model.
+void apply_lineweight_policy(Entities& e, bool is_model) {
+    if (!is_model) return;
+    for (auto& l : e.lines)            l.thickness = 1.0f;
+    for (auto& a : e.arcs)             a.thickness = 1.0f;
+    for (auto& bp : e.bulged_polylines) bp.thickness = 1.0f;
+    for (auto& el : e.ellipses)        el.thickness = 1.0f;
+    for (auto& s : e.splines)          s.thickness  = 1.0f;
+}
+
+void State::load(std::string path, std::string layout) {
     source_path = std::move(path);
-    entities = parse_file(source_path);
+    selected_layout = std::move(layout);
+    entities = parse_file(source_path, selected_layout);
+    // Snap `selected_layout` to whatever `parse_file` actually picked
+    // so the picker's "active" highlight stays accurate when an empty
+    // / stale filter falls through to the first layout in tab order.
+    if (selected_layout.empty() && !entities.layouts.empty()) {
+        selected_layout = entities.layouts.front().name;
+    }
+    // Match Autodesk Viewer: Model = lineweight off, Sheets = on.
+    bool selected_is_model = false;
+    for (auto const& lo : entities.layouts) {
+        if (lo.name == selected_layout && lo.is_model) {
+            selected_is_model = true;
+            break;
+        }
+    }
+    apply_lineweight_policy(entities, selected_is_model);
     layer_visible.clear();
     for (auto const& layer : entities.layers) {
         // Match the DWG file's stored visibility on first paint —
@@ -133,6 +163,18 @@ void update(State& state, Msg msg) {
             if (it != state.layer_visible.end()) {
                 it->second = !it->second;
             }
+        } else if constexpr (std::is_same_v<T, SelectView>) {
+            // Reload the file filtered to the chosen layout. The
+            // existing source_path is reused — only the layout filter
+            // changes between renders. On Android the drawer
+            // auto-closes after a selection so the user immediately
+            // sees the new view; on native the drawer flag is unused.
+            state.load(state.source_path, m.name);
+#ifdef __ANDROID__
+            state.drawer_open = false;
+#endif
+        } else if constexpr (std::is_same_v<T, ToggleDrawer>) {
+            state.drawer_open = !state.drawer_open;
         }
     }, msg);
 }
@@ -196,6 +238,94 @@ void render_layer_panel(State const& state) {
     });
 }
 
+// Mirrors Autodesk Viewer's left sidebar: paper-space layouts under a
+// "Sheets" heading, the implicit Model layout under "Model". One row
+// per layout — single-select via button styling (Primary = active,
+// Default = inactive). `widget::radio` was tried first but its paint
+// cache occasionally failed to repaint the row when transitioning a
+// previously-untouched item from inactive → active in one hop;
+// buttons sidestep that path while delivering the same UX.
+//
+// Display-name mapping: AutoCAD's Model layout is stored with
+// `layout_name = "Model"` in the DWG, but Autodesk Viewer relabels
+// it as "2D View" in the picker. Match that convention so the picker
+// reads the same as the reference viewer. `SelectView` still posts
+// the on-disk layout name so `parse_file` can match it.
+void render_view_panel(State const& state) {
+    using namespace phenotype;
+    if (state.entities.layouts.empty()) return;
+    auto const display_name = [](Layout const& l) -> std::string {
+        return l.is_model ? "2D View" : l.name;
+    };
+    auto const button_for_layout = [&](Layout const& l) {
+        bool const active = (l.name == state.selected_layout);
+        widget::button<Msg>(
+            display_name(l), SelectView{l.name},
+            active ? ButtonVariant::Primary : ButtonVariant::Default);
+    };
+    layout::card([&] {
+        widget::text("Views", TextSize::Body);
+        bool any_sheet = false;
+        for (auto const& l : state.entities.layouts) {
+            if (!l.is_model) { any_sheet = true; break; }
+        }
+        if (any_sheet) {
+            widget::text("Sheets", TextSize::Small, TextColor::Muted);
+            layout::column([&] {
+                for (auto const& l : state.entities.layouts) {
+                    if (l.is_model) continue;
+                    button_for_layout(l);
+                }
+            }, SpaceToken::Xs);
+        }
+        bool any_model = false;
+        for (auto const& l : state.entities.layouts) {
+            if (l.is_model) { any_model = true; break; }
+        }
+        if (any_model) {
+            widget::text("Model", TextSize::Small, TextColor::Muted);
+            layout::column([&] {
+                for (auto const& l : state.entities.layouts) {
+                    if (!l.is_model) continue;
+                    button_for_layout(l);
+                }
+            }, SpaceToken::Xs);
+        }
+    });
+}
+
+} // namespace
+
+// Canvas paint callback. Inlined inside view() to avoid any subtle
+// lifetime issue with extracting it into a helper that returns a
+// lambda capturing a reference to the view's State parameter.
+namespace {
+auto canvas_painter(State const& state) {
+    return [&state](phenotype::Painter& p) {
+        constexpr float kBorder = 2.0f;
+        constexpr phenotype::Color kBorderColor{107, 114, 128, 255};
+        float inset = kBorder * 0.5f;
+        float w = kCanvasWidth  - inset;
+        float h = kCanvasHeight - inset;
+        p.line(inset, inset, w,     inset, kBorder, kBorderColor);
+        p.line(w,     inset, w,     h,     kBorder, kBorderColor);
+        p.line(w,     h,     inset, h,     kBorder, kBorderColor);
+        p.line(inset, h,     inset, inset, kBorder, kBorderColor);
+
+        // Hatches render first so subsequent strokes / arcs / text
+        // overlay correctly. CAD convention.
+        render_hatches(p, state.entities, state.transform,
+                       state.layer_visible);
+        render_lines(p, state.entities, state.transform,
+                     state.layer_visible);
+        render_arcs(p, state.entities, state.transform,
+                    state.layer_visible);
+        render_paths(p, state.entities, state.transform,
+                     state.layer_visible);
+        render_texts(p, state.entities, state.transform,
+                     state.layer_visible);
+    };
+}
 } // namespace
 
 void view(State const& state) {
@@ -203,57 +333,47 @@ void view(State const& state) {
     layout::padded(SpaceToken::Lg, [&] {
         layout::column([&] {
             widget::text("cad++", TextSize::Heading);
-            widget::text("Slab 4 — layer model + visibility panel",
+            widget::text("File: " + state.source_path,
                          TextSize::Small, TextColor::Muted);
             widget::button<Msg>("Open...", OpenRequested{},
                                 ButtonVariant::Primary);
-            widget::text("File: " + state.source_path,
-                         TextSize::Small, TextColor::Muted);
+#ifdef __ANDROID__
+            // Bottom drawer: when open, replace the canvas with the
+            // view + layer pickers + a "Close" button at the top of
+            // the sheet. When closed, show the canvas with a "Views"
+            // toggle anchored beneath it (pull-up handle ergonomics).
+            // Auto-close on selection happens in update() / SelectView.
+            if (state.drawer_open) {
+                widget::button<Msg>("Close", ToggleDrawer{},
+                                    ButtonVariant::Default);
+                render_view_panel(state);
+                render_layer_panel(state);
+            } else {
+                widget::canvas(kCanvasWidth, kCanvasHeight,
+                               canvas_painter(state),
+                               &on_canvas_gesture);
+                widget::button<Msg>("Views", ToggleDrawer{},
+                                    ButtonVariant::Default);
+            }
+#else
+            widget::text(
+                "Slab 9 — view selector + per-layout entity filter",
+                TextSize::Small, TextColor::Muted);
             widget::code(format_summary(state.entities));
-            // Sidebar (layer panel) on the left, canvas on the right.
-            // CrossAxisAlignment::Start keeps the sidebar pinned to
-            // the top edge instead of vertical-centring against the
-            // taller canvas.
+            // Sidebar (view + layer pickers) on the left, canvas on
+            // the right. CrossAxisAlignment::Start keeps the sidebar
+            // pinned to the top edge instead of vertical-centring
+            // against the taller canvas.
             layout::row([&] {
                 layout::column([&] {
+                    render_view_panel(state);
                     render_layer_panel(state);
                 }, SpaceToken::Md);
                 widget::canvas(kCanvasWidth, kCanvasHeight,
-                               [&state](Painter& p) {
-                    // Frame the drawing region so the user can tell where
-                    // the gesture-active surface starts and ends — without
-                    // it the canvas blends into the page background.
-                    // Stroked from the inside (offset by half-thickness)
-                    // so the lines are not clipped by the canvas edge on
-                    // backends that snap to pixel rows.
-                    constexpr float kBorder = 2.0f;
-                    // Qualify with `phenotype::` because Slab 3 added a
-                    // cad++-side `Color` struct (parser.hpp) that shadows
-                    // phenotype's `Color` inside the `cadpp` namespace.
-                    constexpr phenotype::Color kBorderColor{107, 114, 128, 255}; // theme.muted
-                    float inset = kBorder * 0.5f;
-                    float w = kCanvasWidth  - inset;
-                    float h = kCanvasHeight - inset;
-                    p.line(inset, inset, w,     inset, kBorder, kBorderColor);
-                    p.line(w,     inset, w,     h,     kBorder, kBorderColor);
-                    p.line(w,     h,     inset, h,     kBorder, kBorderColor);
-                    p.line(inset, h,     inset, inset, kBorder, kBorderColor);
-
-                    // Hatches render first so subsequent strokes /
-                    // arcs / text overlay correctly. CAD convention.
-                    render_hatches(p, state.entities, state.transform,
-                                   state.layer_visible);
-                    render_lines(p, state.entities, state.transform,
-                                 state.layer_visible);
-                    render_arcs(p, state.entities, state.transform,
-                                state.layer_visible);
-                    render_paths(p, state.entities, state.transform,
-                                 state.layer_visible);
-                    render_texts(p, state.entities, state.transform,
-                                 state.layer_visible);
-                },
+                               canvas_painter(state),
                                &on_canvas_gesture);
             }, SpaceToken::Lg, CrossAxisAlignment::Start);
+#endif
         });
     });
 }
