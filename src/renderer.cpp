@@ -71,13 +71,58 @@ inline bool is_visible(LayerVisibility const& v,
     return it == v.end() ? true : it->second;
 }
 
+// Slab 9 — emit `Painter::push_clip` / `pop_clip` for every clip
+// marker whose `*_idx` field equals `at`. `field` selects which
+// per-vector index to compare against — each render_* loop hands in
+// the field that tracks its own entity vector. The push side projects
+// the marker's paper-space rect through the active `ViewportTransform`
+// (Y-flip + scale) and emits the canvas-pixel bbox so phenotype's
+// scissor lands on the right region. Cursor is local to the caller so
+// the same `clip_markers` stream is walked once per render_* call,
+// keeping the Painter's clip stack balanced (push and pop pairs are
+// emitted by the same render function — viewports never straddle
+// entity-type boundaries because each viewport contributes to all
+// types in one expand_viewport call).
+inline void process_clip_markers(
+        phenotype::Painter& p,
+        std::vector<ClipMarker> const& markers,
+        std::size_t& cursor,
+        std::size_t ClipMarker::* field,
+        std::size_t at,
+        ViewportTransform const& transform) {
+    while (cursor < markers.size() && (markers[cursor].*field) == at) {
+        auto const& m = markers[cursor];
+        if (m.kind == ClipMarker::Kind::Push) {
+            // The active ViewportTransform y-flips world Y → canvas Y,
+            // so the rect's CAD top-left (smaller y) and bottom-right
+            // (larger y) swap on the canvas. Take an axis-aligned
+            // bbox of both projected corners so the canvas-space rect
+            // stays oriented correctly.
+            auto const tl = transform.apply(m.x, m.y);
+            auto const br = transform.apply(m.x + m.w, m.y + m.h);
+            float const cx = static_cast<float>(std::min(tl.x, br.x));
+            float const cy = static_cast<float>(std::min(tl.y, br.y));
+            float const cw = static_cast<float>(std::abs(br.x - tl.x));
+            float const ch = static_cast<float>(std::abs(br.y - tl.y));
+            p.push_clip(cx, cy, cw, ch);
+        } else {
+            p.pop_clip();
+        }
+        ++cursor;
+    }
+}
+
 } // namespace
 
 void render_lines(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform,
                   LayerVisibility const& visibility) {
-    for (auto const& l : entities.lines) {
+    std::size_t cursor = 0;
+    for (std::size_t i = 0; i < entities.lines.size(); ++i) {
+        process_clip_markers(p, entities.clip_markers, cursor,
+                             &ClipMarker::lines_idx, i, transform);
+        auto const& l = entities.lines[i];
         if (!is_visible(visibility, l.layer_name)) continue;
         auto const a = transform.apply(l.a.x, l.a.y);
         auto const b = transform.apply(l.b.x, l.b.y);
@@ -85,13 +130,20 @@ void render_lines(phenotype::Painter& p,
                static_cast<float>(b.x), static_cast<float>(b.y),
                l.thickness, to_paint(l.color));
     }
+    process_clip_markers(p, entities.clip_markers, cursor,
+                         &ClipMarker::lines_idx,
+                         entities.lines.size(), transform);
 }
 
 void render_texts(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform,
                   LayerVisibility const& visibility) {
-    for (auto const& t : entities.texts) {
+    std::size_t cursor = 0;
+    for (std::size_t ti = 0; ti < entities.texts.size(); ++ti) {
+        process_clip_markers(p, entities.clip_markers, cursor,
+                             &ClipMarker::texts_idx, ti, transform);
+        auto const& t = entities.texts[ti];
         if (t.content.empty()) continue;
         if (!is_visible(visibility, t.layer_name)) continue;
         float const font_px = static_cast<float>(t.height * transform.scale);
@@ -157,13 +209,20 @@ void render_texts(phenotype::Painter& p,
                static_cast<unsigned int>(t.content.size()),
                font_px, to_paint(t.color), font_spec);
     }
+    process_clip_markers(p, entities.clip_markers, cursor,
+                         &ClipMarker::texts_idx,
+                         entities.texts.size(), transform);
 }
 
 void render_arcs(phenotype::Painter& p,
                  Entities const& entities,
                  ViewportTransform const& transform,
                  LayerVisibility const& visibility) {
-    for (auto const& a : entities.arcs) {
+    std::size_t cursor = 0;
+    for (std::size_t i = 0; i < entities.arcs.size(); ++i) {
+        process_clip_markers(p, entities.clip_markers, cursor,
+                             &ClipMarker::arcs_idx, i, transform);
+        auto const& a = entities.arcs[i];
         if (!is_visible(visibility, a.layer_name)) continue;
         auto const center_canvas = transform.apply(a.center.x, a.center.y);
         float const r_px = static_cast<float>(a.radius * transform.scale);
@@ -181,6 +240,9 @@ void render_arcs(phenotype::Painter& p,
               canvas_start, canvas_end,
               a.thickness, to_paint(a.color));
     }
+    process_clip_markers(p, entities.clip_markers, cursor,
+                         &ClipMarker::arcs_idx,
+                         entities.arcs.size(), transform);
 }
 
 namespace {
@@ -232,7 +294,11 @@ void render_paths(phenotype::Painter& p,
     // uniform parameter steps for NURBS, fit-point passthrough for
     // Bezier-scenario splines), so this path is just a polyline
     // emit. Closed splines get a final `Close` verb.
-    for (auto const& sp : entities.splines) {
+    std::size_t spline_cursor = 0;
+    for (std::size_t spi = 0; spi < entities.splines.size(); ++spi) {
+        process_clip_markers(p, entities.clip_markers, spline_cursor,
+                             &ClipMarker::splines_idx, spi, transform);
+        auto const& sp = entities.splines[spi];
         if (sp.points.size() < 2) continue;
         if (!is_visible(visibility, sp.layer_name)) continue;
         phenotype::PathBuilder pb;
@@ -249,9 +315,16 @@ void render_paths(phenotype::Painter& p,
         if (sp.closed) pb.close();
         p.stroke_path(pb, sp.thickness, to_paint(sp.color));
     }
+    process_clip_markers(p, entities.clip_markers, spline_cursor,
+                         &ClipMarker::splines_idx,
+                         entities.splines.size(), transform);
 
     // ---- Bulged LWPOLYLINE → MoveTo + (LineTo | ArcTo) chain ----
-    for (auto const& bp : entities.bulged_polylines) {
+    std::size_t bulged_cursor = 0;
+    for (std::size_t bi = 0; bi < entities.bulged_polylines.size(); ++bi) {
+        process_clip_markers(p, entities.clip_markers, bulged_cursor,
+                             &ClipMarker::bulged_idx, bi, transform);
+        auto const& bp = entities.bulged_polylines[bi];
         if (bp.vertices.size() < 2) continue;
         if (!is_visible(visibility, bp.layer_name)) continue;
         phenotype::PathBuilder pb;
@@ -299,6 +372,9 @@ void render_paths(phenotype::Painter& p,
         if (bp.closed) pb.close();
         p.stroke_path(pb, bp.thickness, to_paint(bp.color));
     }
+    process_clip_markers(p, entities.clip_markers, bulged_cursor,
+                         &ClipMarker::bulged_idx,
+                         entities.bulged_polylines.size(), transform);
 
     // ---- ELLIPSE → MoveTo + cubic_to per ≤90° quadrant ----
     //
@@ -317,7 +393,11 @@ void render_paths(phenotype::Painter& p,
     // Cubic Béziers are affine-invariant, so we can compute control
     // points in CAD-world space and then transform every point through
     // `ViewportTransform::apply` — the y-flip is automatic.
-    for (auto const& e : entities.ellipses) {
+    std::size_t ellipse_cursor = 0;
+    for (std::size_t ei = 0; ei < entities.ellipses.size(); ++ei) {
+        process_clip_markers(p, entities.clip_markers, ellipse_cursor,
+                             &ClipMarker::ellipses_idx, ei, transform);
+        auto const& e = entities.ellipses[ei];
         if (!is_visible(visibility, e.layer_name)) continue;
         // Major axis vector U; perpendicular V is U rotated 90° CCW
         // (in CAD's y-up frame) scaled by minor_ratio.
@@ -380,6 +460,9 @@ void render_paths(phenotype::Painter& p,
         }
         p.stroke_path(pb, e.thickness, to_paint(e.color));
     }
+    process_clip_markers(p, entities.clip_markers, ellipse_cursor,
+                         &ClipMarker::ellipses_idx,
+                         entities.ellipses.size(), transform);
 }
 
 void render_hatches(phenotype::Painter& p,
@@ -391,7 +474,11 @@ void render_hatches(phenotype::Painter& p,
     // time, so the renderer just walks each loop's vertex list as a
     // `MoveTo + LineTo*` chain. Phenotype's `fill_path` implicitly
     // closes the polygon, so no explicit `Close` verb is needed.
-    for (auto const& h : entities.hatches) {
+    std::size_t cursor = 0;
+    for (std::size_t hi = 0; hi < entities.hatches.size(); ++hi) {
+        process_clip_markers(p, entities.clip_markers, cursor,
+                             &ClipMarker::hatches_idx, hi, transform);
+        auto const& h = entities.hatches[hi];
         if (!is_visible(visibility, h.layer_name)) continue;
         for (auto const& loop : h.loops) {
             if (loop.size() < 3) continue;
@@ -407,6 +494,9 @@ void render_hatches(phenotype::Painter& p,
             p.fill_path(pb, to_paint(h.color));
         }
     }
+    process_clip_markers(p, entities.clip_markers, cursor,
+                         &ClipMarker::hatches_idx,
+                         entities.hatches.size(), transform);
 }
 
 } // namespace cadpp
