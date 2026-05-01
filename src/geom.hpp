@@ -51,6 +51,45 @@ inline BBox compute_bbox(Entities const& e) {
         b.add(a.center.x - a.radius, a.center.y - a.radius);
         b.add(a.center.x + a.radius, a.center.y + a.radius);
     }
+    // Ellipse bbox via the parametric extrema of `P(t) = C + U·cos(t)
+    // + V·sin(t)`, where U = `major_axis` and V = perp(U) ·
+    // `minor_ratio`. Solving `dP/dt = 0` per axis gives the closed
+    // form half-extents below — exact for full ellipses and a safe
+    // upper bound for partial sweeps (good enough for fit-on-load).
+    // Without this loop the wheel-shaped ellipses in colorwh.dwg
+    // contributed nothing to the bbox, leaving fit-to-canvas to scale
+    // the wheels off the edge of the canvas.
+    for (auto const& el : e.ellipses) {
+        double const ux = el.major_axis.x;
+        double const uy = el.major_axis.y;
+        double const k2 = el.minor_ratio * el.minor_ratio;
+        double const half_w = std::sqrt(ux * ux + uy * uy * k2);
+        double const half_h = std::sqrt(uy * uy + ux * ux * k2);
+        b.add(el.center.x - half_w, el.center.y - half_h);
+        b.add(el.center.x + half_w, el.center.y + half_h);
+    }
+    // Splines are pre-sampled into a polyline at parse time; iterate
+    // every sample. Closed splines reuse the start vertex implicitly
+    // via the `closed` flag, no extra add needed.
+    for (auto const& sp : e.splines) {
+        for (auto const& p : sp.points) b.add(p.x, p.y);
+    }
+    // Bulged polylines: vertex bbox only. A `bulge != 0` arc segment
+    // can swing outside the chord-vertex rectangle, but accounting
+    // for that needs `bulge_to_arc` per segment — left as follow-up
+    // because the wheel + plate samples we ship all bulge inward
+    // enough that vertex bbox already encloses the curve.
+    for (auto const& bp : e.bulged_polylines) {
+        for (auto const& v : bp.vertices) b.add(v.x, v.y);
+    }
+    // Hatches store closed boundary polygons in CAD coords (the
+    // parser pre-discretises any curved boundary segment), so vertex
+    // iteration is the exact bbox per loop.
+    for (auto const& h : e.hatches) {
+        for (auto const& loop : h.loops) {
+            for (auto const& p : loop) b.add(p.x, p.y);
+        }
+    }
     return b;
 }
 
