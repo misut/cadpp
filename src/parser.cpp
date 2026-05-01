@@ -198,6 +198,121 @@ std::vector<double> resolve_entity_dashes(
     return dashes;
 }
 
+// Slab 8 — extract a phenotype-friendly Style record from a parsed
+// `Dwg_Object_STYLE`. Bold / Italic detection follows the substring
+// convention DWG fonts have used since the SHX / TTF era: file names
+// like "arialbd.ttf", "ARIALBI.TTF", "ariali.ttf" carry weight + slant
+// hints in their basename. The extracted family strips those suffix
+// tokens so the renderer can pass a clean family name to phenotype.
+//
+// `font_file` may arrive as an empty string (legacy DWGs that only
+// reference SHX files by name) — we still emit a Style entry so the
+// renderer doesn't have to special-case absence; it'll fall back to
+// the platform default font through phenotype's empty-family path.
+inline bool contains_ci(std::string const& haystack, std::string_view needle) {
+    if (needle.empty() || needle.size() > haystack.size()) return false;
+    auto tolower_byte = [](char c) -> char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+    };
+    for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (std::size_t k = 0; k < needle.size(); ++k) {
+            if (tolower_byte(haystack[i + k]) != tolower_byte(needle[k])) {
+                match = false; break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+inline std::string extract_family_from_font_file(std::string const& font_file) {
+    if (font_file.empty()) return {};
+    // Take the basename — strip any directory component (DWG STYLE
+    // entries are normally bare filenames but some files store full
+    // Windows paths).
+    auto slash = font_file.find_last_of("/\\");
+    std::string base = (slash == std::string::npos)
+        ? font_file
+        : font_file.substr(slash + 1);
+    // Strip the file extension (.ttf / .shx / .otf / .ttc — case-
+    // insensitive — preserve everything else).
+    auto dot = base.find_last_of('.');
+    if (dot != std::string::npos) base.resize(dot);
+    if (base.empty()) return {};
+    // Trailing weight / italic markers — strip them so the family
+    // name resolves to "Arial" instead of "ArialBd". Keep the trailing
+    // strip case-sensitive to the byte; the substring tests upstream
+    // already mark the entry Bold/Italic for the FontSpec.
+    auto strip_suffix_ci = [&](std::string_view suffix) -> bool {
+        if (base.size() <= suffix.size()) return false;
+        auto pos = base.size() - suffix.size();
+        for (std::size_t i = 0; i < suffix.size(); ++i) {
+            char a = base[pos + i];
+            char b = suffix[i];
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+            if (a != b) return false;
+        }
+        base.resize(pos);
+        return true;
+    };
+    // Order matters — strip the longer markers first so "BoldItalic"
+    // doesn't leave a stray "italic" suffix on the family name.
+    strip_suffix_ci("bolditalic")
+        || strip_suffix_ci("italic")
+        || strip_suffix_ci("oblique")
+        || strip_suffix_ci("bold")
+        || strip_suffix_ci("bd")
+        || strip_suffix_ci("bi")
+        || strip_suffix_ci("it")
+        || strip_suffix_ci("i");
+    return base;
+}
+
+// Build a Style record from a LibreDWG `Dwg_Object_STYLE` payload.
+// Both the STYLE-table iteration in `extract()` and the entity-side
+// `resolve_entity_style()` go through this so the (font_file → family,
+// bold, italic) decoding stays consistent.
+Style style_from_dwg(Dwg_Data const* dwg, Dwg_Object_STYLE const* sty) {
+    Style out{};
+    if (sty == nullptr) return out;
+    if (sty->name) out.name = read_text_field(dwg, sty->name);
+    if (sty->font_file) out.font_file = read_text_field(dwg, sty->font_file);
+    out.bold = contains_ci(out.font_file, "bd")
+            || contains_ci(out.font_file, "bold");
+    bool const has_italic_token =
+        contains_ci(out.font_file, "italic")
+        || contains_ci(out.font_file, "oblique");
+    out.italic = has_italic_token
+        // Avoid promoting "arialbi.ttf" to italic-only — the bold flag
+        // is already set above; keep both bits when the file name has
+        // both markers, but don't infer italic from the trailing "i"
+        // when the entry is already Bold (that's just how AutoCAD
+        // names BoldItalic faces).
+        || (!out.bold && (contains_ci(out.font_file, "i.ttf")
+                       || contains_ci(out.font_file, "i.shx")));
+    out.font_family = extract_family_from_font_file(out.font_file);
+    return out;
+}
+
+// Resolve an entity's STYLE handle by dereferencing it directly into
+// LibreDWG's object table — independent of iteration order so this
+// works whether STYLE table objects come before or after the entity
+// records that reference them. Returns Style{} when the handle is
+// missing or doesn't point at a STYLE record. Mirrors the entity-side
+// path used for LTYPE in `resolve_entity_dashes`.
+Style resolve_entity_style(Dwg_Data* dwg, BITCODE_H style_ref) {
+    if (style_ref == nullptr || dwg == nullptr) return {};
+    Dwg_Object* obj = dwg_ref_object(dwg, style_ref);
+    if (obj == nullptr
+        || obj->supertype != DWG_SUPERTYPE_OBJECT
+        || static_cast<int>(obj->fixedtype) != DWG_TYPE_STYLE) {
+        return {};
+    }
+    return style_from_dwg(dwg, obj->tio.object->tio.STYLE);
+}
+
 // Slab 7c — walk an N-vertex polyline (open or closed), decomposing
 // it into one `Line` record per dash interval. Continues the dash
 // pattern across vertex boundaries so multi-segment polylines
@@ -694,6 +809,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (v_align == 2) ? TextVAlign::Middle :
                 (v_align == 3) ? TextVAlign::Top    :
                                  TextVAlign::Baseline;
+            Style style = resolve_entity_style(dwg, t->style);
             out.texts.push_back(Text{
                 xf.apply_point(anchor.x, anchor.y),
                 t->height * xf.scale_factor(),
@@ -701,6 +817,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 meta.color,
                 std::move(meta.layer_name),
                 ha, va,
+                std::move(style),
             });
             ++out.text_count;
             break;
@@ -724,6 +841,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (att == 1 || att == 2 || att == 3) ? TextVAlign::Top    :
                 (att == 4 || att == 5 || att == 6) ? TextVAlign::Middle :
                                                      TextVAlign::Bottom;
+            Style style = resolve_entity_style(dwg, m->style);
             out.texts.push_back(Text{
                 xf.apply_point(m->ins_pt.x, m->ins_pt.y),
                 m->text_height * xf.scale_factor(),
@@ -731,6 +849,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 meta.color,
                 std::move(meta.layer_name),
                 ha, va,
+                std::move(style),
             });
             ++out.text_count;
             break;
@@ -1227,6 +1346,20 @@ void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
             }
             out.linetypes.push_back(std::move(line_type));
             ++out.linetype_count;
+        }
+        return;
+    }
+
+    // Slab 8 — STYLE table entries. The summary card surfaces how
+    // many text styles the DWG ships; TEXT / MTEXT entities resolve
+    // their own STYLE handle via `resolve_entity_style` so iteration
+    // order is irrelevant for correctness.
+    if (obj->supertype == DWG_SUPERTYPE_OBJECT
+        && static_cast<int>(obj->fixedtype) == DWG_TYPE_STYLE) {
+        auto const* sty = obj->tio.object->tio.STYLE;
+        if (sty != nullptr && sty->name != nullptr) {
+            out.styles.push_back(style_from_dwg(dwg, sty));
+            ++out.style_count;
         }
         return;
     }

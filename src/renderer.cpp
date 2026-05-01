@@ -97,14 +97,25 @@ void render_texts(phenotype::Painter& p,
         float const font_px = static_cast<float>(t.height * transform.scale);
         if (font_px < 4.0f) continue;  // below visual threshold; skip
 
-        // Heuristic glyph metrics calibrated against Arial Regular
-        // em widths (`char_em_width`). Lands within ±1 px of the
-        // actual rasterised position for typical CAD labels — much
-        // closer than a flat per-char average. Future work: query
-        // phenotype's `measure_text` host hook for pixel-perfect
-        // alignment.
-        float const approx_w = font_px
-            * text_advance_em(t.content.data(), t.content.size());
+        // Build the FontSpec from the entity's resolved STYLE.
+        phenotype::FontSpec font_spec{
+            std::string_view{t.style.font_family},
+            t.style.bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
+            t.style.italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
+            false,
+        };
+
+        // Pixel-perfect run width via phenotype's measure_text. Falls
+        // back to the heuristic em-width LUT when the host can't
+        // measure (returns 0 / NaN) — keeps alignment usable on test
+        // hosts that wire up a stub measurer.
+        float measured = p.measure_text(
+            t.content.data(),
+            static_cast<unsigned int>(t.content.size()),
+            font_px, font_spec);
+        float const approx_w = (measured > 0.0f && std::isfinite(measured))
+            ? measured
+            : font_px * text_advance_em(t.content.data(), t.content.size());
 
         // DWG anchor (`t.position`) lives at the baseline / Aligned
         // corner per the entity's H/V alignment. Convert to the
@@ -144,7 +155,7 @@ void render_texts(phenotype::Painter& p,
         p.text(ax, ay,
                t.content.data(),
                static_cast<unsigned int>(t.content.size()),
-               font_px, to_paint(t.color));
+               font_px, to_paint(t.color), font_spec);
     }
 }
 

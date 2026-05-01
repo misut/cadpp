@@ -57,6 +57,25 @@ enum class TextVAlign : std::uint8_t {
     Top      = 3,
 };
 
+// DWG STYLE table entry (subset). The parser extracts what the
+// renderer needs to round-trip TEXT/MTEXT through phenotype's FontSpec:
+// the human-readable family name (derived from `font_file`'s basename
+// minus weight/italic suffix tokens), and Bold/Italic flags inferred
+// from substring tokens in `font_file` (e.g. "arialbd.ttf" → Bold,
+// "ariali.ttf" → Italic). The raw `font_file` is kept for diagnostics
+// and for cases where consumers want to do their own resolution.
+//
+// LibreDWG's `Dwg_Object_STYLE` carries the underlying `flag` bit field
+// too (vertical / shape / etc) but those don't affect text rendering
+// at the level cad++ does today.
+struct Style {
+    std::string  name;          // STYLE table entry name (e.g. "Standard")
+    std::string  font_family;   // extracted from font_file basename
+    std::string  font_file;     // raw "arialbd.ttf" / "Arial.ttf" / etc.
+    bool         bold   = false;
+    bool         italic = false;
+};
+
 struct Text {
     Point position;        // CAD coords — anchor point per (h_align, v_align)
     double height = 0.0;   // CAD units (font height in world space)
@@ -65,6 +84,9 @@ struct Text {
     std::string layer_name;
     TextHAlign h_align = TextHAlign::Left;
     TextVAlign v_align = TextVAlign::Baseline;
+    // Resolved STYLE handle data — empty Style{} when the TEXT/MTEXT
+    // entity has no STYLE handle or the handle could not be resolved.
+    Style style;
 };
 
 // CIRCLE and ARC entities, kept as native arcs so the renderer can
@@ -218,6 +240,7 @@ struct Entities {
     std::vector<Hatch>   hatches;                  // AutoCAD HATCH entities (Slab 5)
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
     std::vector<Linetype> linetypes;               // DWG LTYPE table (Slab 7)
+    std::vector<Style>   styles;                   // DWG STYLE table (Slab 8 — fonts)
 
     // Source-entity counts (before tessellation) so the summary card
     // can show what kinds of geometry came in.
@@ -233,6 +256,7 @@ struct Entities {
     unsigned int dimension_count = 0;  // Slab 5 — DIMENSION pre-rendered blocks expanded
     unsigned int hatch_count = 0;      // Slab 5 — HATCH boundary loops captured
     unsigned int linetype_count = 0;   // Slab 7 — LTYPE table entries captured
+    unsigned int style_count = 0;      // Slab 8 — STYLE table entries captured
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.
