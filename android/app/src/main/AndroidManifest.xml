@@ -18,7 +18,7 @@
             android:exported="true"
             android:theme="@style/Theme.Cadpp"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode"
-            android:launchMode="singleTask">
+            android:launchMode="singleTop">
 
             <!-- GameActivity loads the .so by name; matches the cmake
                  target in app/src/main/cpp/CMakeLists.txt. -->
