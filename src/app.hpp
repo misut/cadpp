@@ -53,6 +53,15 @@ struct State {
     Entities entities;
     ViewportTransform transform;
     std::string source_path;
+    // Selected layout name (empty = first layout in tab order).
+    // Drives both `parse_file`'s entity filter and the view-selector
+    // panel's "active" highlight.
+    std::string selected_layout;
+    // Android only: whether the bottom drawer (view + layer picker) is
+    // currently expanded. Native ignores this — its sidebar is always
+    // visible. Defaults to open so the user sees the available views
+    // immediately on first paint.
+    bool drawer_open = true;
     // Layer name -> rendered? Initialised from each layer's
     // `frozen` / `off` flag at parse time so the viewer matches the
     // DWG's stored visibility on first paint, but the user can flip
@@ -61,9 +70,11 @@ struct State {
 
     State();
 
-    // Re-parse `path` and refit the viewport. Called from update()
-    // when the platform file dialog returns with a new file.
-    void load(std::string path);
+    // Re-parse `path` (filtered to `layout`, empty = first layout) and
+    // refit the viewport. Called from update() on file open or view
+    // selection. `layout` defaults to keeping the currently-selected
+    // view name when the caller wants to reload the same layout.
+    void load(std::string path, std::string layout = {});
 };
 
 struct Noop {};
@@ -108,8 +119,22 @@ struct ToggleLayer {
     std::string name;
 };
 
+// Dispatched by the view-selector panel's per-row radio button.
+// update() reloads the file filtered to the chosen layout. On
+// Android the same dispatch flips `drawer_open = false` so the
+// drawer auto-closes after a selection.
+struct SelectView {
+    std::string name;
+};
+
+// Dispatched by the Android drawer's toggle button. update() flips
+// `drawer_open`. Native ignores `drawer_open` so this message is a
+// no-op there (kept in the variant for source compatibility).
+struct ToggleDrawer {};
+
 using Msg = std::variant<Noop, OpenRequested, FileChosen,
-                         Pan, Zoom, ToggleLayer>;
+                         Pan, Zoom, ToggleLayer,
+                         SelectView, ToggleDrawer>;
 
 void update(State&, Msg);
 

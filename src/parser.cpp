@@ -1430,22 +1430,75 @@ void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
         return;
     }
 
+    // DWG LAYOUT objects — the user-facing "Sheets + Model" view list.
+    // Each LAYOUT owns a BLOCK_HEADER whose entities form the layout's
+    // drawing content; we capture the layout name + tab order plus the
+    // block-header name so the post-pass can route a
+    // `layout_filter` selection to the right block-header walk.
+    if (obj->supertype == DWG_SUPERTYPE_OBJECT
+        && static_cast<int>(obj->fixedtype) == DWG_TYPE_LAYOUT) {
+        auto const* lo = obj->tio.object->tio.LAYOUT;
+        if (lo != nullptr && lo->layout_name != nullptr) {
+            Layout layout{};
+            layout.name      = read_text_field(dwg, lo->layout_name);
+            layout.tab_order = static_cast<int>(lo->tab_order);
+            // Resolve the BLOCK_HEADER handle to its name. The Model
+            // layout's block-header is the file's `BLOCK_RECORD_MSPACE`;
+            // each paper-space sheet has its own `*PAPER_SPACEn` /
+            // `*Layoutn` block-header.
+            if (lo->block_header != nullptr) {
+                Dwg_Object* bh_obj = dwg_ref_object(dwg, lo->block_header);
+                if (bh_obj != nullptr
+                    && bh_obj->supertype == DWG_SUPERTYPE_OBJECT) {
+                    auto const* bh = bh_obj->tio.object->tio.BLOCK_HEADER;
+                    if (bh != nullptr && bh->name != nullptr) {
+                        layout.block_owner = read_text_field(dwg, bh->name);
+                    }
+                }
+            }
+            // Match against the file's MSPACE block-record to flag the
+            // implicit Model layout. Compare absolute handles since the
+            // DWG spec allows variation in `*MODEL_SPACE` casing across
+            // versions.
+            BITCODE_H mspace = dwg->header_vars.BLOCK_RECORD_MSPACE;
+            if (mspace != nullptr && lo->block_header != nullptr) {
+                if (mspace->absolute_ref == lo->block_header->absolute_ref) {
+                    layout.is_model = true;
+                }
+            }
+            out.layouts.push_back(std::move(layout));
+            ++out.layout_count;
+        }
+        return;
+    }
+
     if (obj->supertype != DWG_SUPERTYPE_ENTITY) return;
+}
 
-    // Slab 5 — Model-Space filter. Block-owned entities (entmode == 3)
-    // would otherwise render at their block-local coordinates,
-    // independent of any INSERT. They reach the renderer only via the
-    // INSERT case in `extract_entity_xf`, which composes the block's
-    // transform. Paper-Space (entmode == 1) is skipped for now —
-    // cad++ doesn't expose the plot view yet.
-    if (obj->tio.entity->entmode != 2 /* MSPACE */) return;
-
-    extract_entity_xf(dwg, obj, Affine::identity(), out);
+// Walk the entities array of one BLOCK_HEADER (model space's
+// `*MODEL_SPACE`, paper-space's `*PAPER_SPACE`, or a named layout's
+// `*Layoutn` block). Each entity inside is extracted at identity xf
+// because the block-header walk supplies entities already in their
+// layout's own frame; INSERTs nested inside still get their own
+// affine composition via `extract_entity_xf`.
+void extract_layout_entities(Dwg_Data* dwg,
+                             Dwg_Object_BLOCK_HEADER const* bh,
+                             Entities& out) {
+    if (bh == nullptr || bh->entities == nullptr) return;
+    for (BITCODE_BL i = 0; i < bh->num_owned; ++i) {
+        BITCODE_H href = bh->entities[i];
+        if (href == nullptr) continue;
+        Dwg_Object* eobj = dwg_ref_object(dwg, href);
+        if (eobj == nullptr) continue;
+        if (eobj->supertype != DWG_SUPERTYPE_ENTITY) continue;
+        extract_entity_xf(dwg, eobj, Affine::identity(), out);
+    }
 }
 
 } // namespace
 
-Entities parse_file(std::string_view path) {
+Entities parse_file(std::string_view path,
+                    std::string_view layout_filter) {
     Entities entities;
     Dwg_Data dwg{};
 
@@ -1459,9 +1512,100 @@ Entities parse_file(std::string_view path) {
 
     entities.version = version_string(static_cast<unsigned int>(dwg.header.version));
 
+    // Pass 1: walk all DWG objects to populate tables (LAYER, LTYPE,
+    // STYLE, LAYOUT). Entities are NOT extracted here — that is done
+    // per-layout in pass 2 so the renderer sees only the selected
+    // layout's content instead of every layout flattened together.
     auto const num_objects = dwg.num_objects;
     for (BITCODE_BL i = 0; i < num_objects; ++i) {
         extract(&dwg, &dwg.object[i], entities);
+    }
+
+    // Sort layouts by DWG-defined tab order so the UI list matches the
+    // file's sheet order. Stable so equal-order ties keep insertion
+    // order (which mirrors `dwg.object[i]` walk order).
+    std::stable_sort(entities.layouts.begin(), entities.layouts.end(),
+        [](Layout const& a, Layout const& b) {
+            return a.tab_order < b.tab_order;
+        });
+
+    // Pick which layout's entities to extract. Empty filter → first
+    // layout in tab order. Unrecognised name → fall back to the first
+    // layout so a stale `selected_layout` from a previous file doesn't
+    // produce an empty render.
+    Layout const* selected = nullptr;
+    if (!entities.layouts.empty()) {
+        if (!layout_filter.empty()) {
+            for (auto const& lo : entities.layouts) {
+                if (lo.name == layout_filter) { selected = &lo; break; }
+            }
+        }
+        if (selected == nullptr) selected = &entities.layouts.front();
+    }
+
+    // Pass 2: walk the selected layout's BLOCK_HEADER entities[]. For
+    // paper-space sheets, ALSO walk the Model BLOCK_HEADER so the
+    // sheet's VIEWPORT-referenced model content is visible — until
+    // proper VIEWPORT clipping/scaling lands, this approximation lets
+    // every Sheet show the same drawing as Model (just with the
+    // sheet's title block / annotations on top instead of through a
+    // viewport frame). Without it, sheets render blank because their
+    // own block-header typically owns just a few VIEWPORT pointers
+    // that cad++ doesn't yet decode.
+    //
+    // Falls back to the legacy `entmode == 2 (MSPACE)` filter when no
+    // layouts were resolved (malformed file or LibreDWG version that
+    // doesn't expose LAYOUT objects), keeping pre-slab behaviour
+    // intact for the regression matrix.
+    if (selected != nullptr && !selected->block_owner.empty()) {
+        Dwg_Object_BLOCK_HEADER const* selected_bh = nullptr;
+        Dwg_Object_BLOCK_HEADER const* model_bh    = nullptr;
+        for (BITCODE_BL i = 0; i < num_objects; ++i) {
+            Dwg_Object const* o = &dwg.object[i];
+            if (o->supertype != DWG_SUPERTYPE_OBJECT) continue;
+            if (static_cast<int>(o->fixedtype) != DWG_TYPE_BLOCK_HEADER) continue;
+            auto const* bh = o->tio.object->tio.BLOCK_HEADER;
+            if (bh == nullptr || bh->name == nullptr) continue;
+            std::string const bh_name = read_text_field(&dwg, bh->name);
+            if (selected_bh == nullptr && bh_name == selected->block_owner) {
+                selected_bh = bh;
+            }
+            // The implicit Model layout's block-header is `*Model_Space`
+            // (or whichever name `BLOCK_RECORD_MSPACE` resolves to). We
+            // use the by-name match here because the layout walk in
+            // pass 1 already records that name on the Model layout.
+            if (model_bh == nullptr) {
+                for (auto const& lo : entities.layouts) {
+                    if (lo.is_model && bh_name == lo.block_owner) {
+                        model_bh = bh;
+                        break;
+                    }
+                }
+            }
+            if (selected_bh != nullptr
+                && (model_bh != nullptr || selected->is_model)) {
+                break;
+            }
+        }
+        if (selected_bh != nullptr) {
+            extract_layout_entities(&dwg, selected_bh, entities);
+        }
+        // For non-Model sheets, layer the Model-space content on top
+        // (or under, since render order is hatches→lines→arcs→etc.,
+        // independent of extraction order). The sheet's own paper-
+        // space decorations (title block etc.) ride along too.
+        if (!selected->is_model && model_bh != nullptr
+            && model_bh != selected_bh) {
+            extract_layout_entities(&dwg, model_bh, entities);
+        }
+    } else {
+        // Fallback path — preserve pre-slab behaviour.
+        for (BITCODE_BL i = 0; i < num_objects; ++i) {
+            Dwg_Object const* o = &dwg.object[i];
+            if (o->supertype != DWG_SUPERTYPE_ENTITY) continue;
+            if (o->tio.entity->entmode != 2) continue;
+            extract_entity_xf(&dwg, o, Affine::identity(), entities);
+        }
     }
 
     dwg_free(&dwg);

@@ -216,6 +216,19 @@ struct Linetype {
     std::vector<double> dashes;
 };
 
+// DWG LAYOUT table entry. Each LAYOUT corresponds to one selectable
+// "view" in the model picker — Autodesk Viewer shows the file's
+// layouts as Sheets (paper-space) plus the implicit Model layout.
+// `block_owner` carries the BLOCK_HEADER name (e.g. `*MODEL_SPACE`,
+// `*PAPER_SPACE`, `*Layout1`) whose entities make up this layout's
+// content; the parser uses it as the per-layout selection key.
+struct Layout {
+    std::string name;          // user-visible (e.g. "Model", "True Color")
+    int         tab_order = 0; // DWG-defined ordering for the picker
+    bool        is_model  = false;
+    std::string block_owner;   // BLOCK_HEADER name owning this layout's entities
+};
+
 // Slab 2.a: parse a .dwg file into native draw primitives. CIRCLE
 // and ARC ride a dedicated `Arc` list (no parse-time chord
 // tessellation) so phenotype's `Painter::arc` rasterises them at
@@ -241,6 +254,7 @@ struct Entities {
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
     std::vector<Linetype> linetypes;               // DWG LTYPE table (Slab 7)
     std::vector<Style>   styles;                   // DWG STYLE table (Slab 8 — fonts)
+    std::vector<Layout>  layouts;                  // DWG LAYOUT table — user-selectable views
 
     // Source-entity counts (before tessellation) so the summary card
     // can show what kinds of geometry came in.
@@ -257,12 +271,19 @@ struct Entities {
     unsigned int hatch_count = 0;      // Slab 5 — HATCH boundary loops captured
     unsigned int linetype_count = 0;   // Slab 7 — LTYPE table entries captured
     unsigned int style_count = 0;      // Slab 8 — STYLE table entries captured
+    unsigned int layout_count = 0;     // DWG LAYOUT objects captured
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.
     unsigned int unknown_entities = 0;
 };
 
-Entities parse_file(std::string_view path);
+// Parse a DWG file into native draw primitives. `layout_filter` selects
+// which layout's entities are extracted: empty → first layout in tab
+// order (typically Model). The `Entities::layouts` vector is always
+// populated regardless of which layout was selected, so the UI can
+// list every available view on first paint.
+Entities parse_file(std::string_view path,
+                    std::string_view layout_filter = {});
 
 } // namespace cadpp
