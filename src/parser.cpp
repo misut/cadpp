@@ -34,10 +34,21 @@ constexpr int kColorMethodTruecolor = 0xc3;
 // cad++ default ink (Color{}). ACI 7 ("white-on-dark, black-on-light")
 // stays a fall-through because rendering ACI-7 white-on-light would
 // be invisible — matches every CAD viewer.
+//
+// LibreDWG sometimes normalises an entity-level CMC to method=VOID
+// while baking the original method into the *top byte* of `rgb`
+// (0xc2 = ACI, 0xc3 = TRUECOLOR). Treat that byte as the effective
+// method so colours buried in `rgb` still resolve. Without this,
+// AutoCAD-authored files that store per-entity colour as method=VOID
+// (e.g. the colorwh.dwg sample, which paints its 70k+ SOLID wedges
+// this way) collapse to BYLAYER / default ink.
 bool is_resolvable_cmc(Dwg_Color const& c) {
     int const method = static_cast<int>(c.method);
-    if (method == kColorMethodTruecolor) return true;
-    if (method == kColorMethodAci) {
+    int const top    = static_cast<int>(
+        (static_cast<unsigned>(c.rgb) >> 24) & 0xffu);
+    int const effective = (method != 0) ? method : top;
+    if (effective == kColorMethodTruecolor) return true;
+    if (effective == kColorMethodAci || effective == 0) {
         int const idx = static_cast<int>(c.index);
         return idx > 0 && idx != 7 && idx < 256;
     }
@@ -47,29 +58,48 @@ bool is_resolvable_cmc(Dwg_Color const& c) {
 // Translate a resolvable CMC to RGBA. Non-resolvable CMCs return the
 // cad++ default ink — callers normally check `is_resolvable_cmc` first
 // and fall back to the layer's colour before hitting that branch.
+//
+// Resolution order:
+//   1. Effective method TRUECOLOR → take the lower 24 bits of `rgb`
+//      directly (works for both explicit method=0xc3 and method=VOID
+//      with top-byte 0xc3).
+//   2. Effective method ACI with cached lower 24 bits in `rgb`
+//      (LibreDWG pre-resolves the palette for some entities) → use
+//      the cached RGB.
+//   3. Otherwise look up the ACI palette via `c.index`.
 Color color_from_cmc(Dwg_Color const& c) {
     int const method = static_cast<int>(c.method);
-    if (method == kColorMethodTruecolor) {
-        std::uint32_t const rgb = static_cast<std::uint32_t>(c.rgb);
+    std::uint32_t const rgb = static_cast<std::uint32_t>(c.rgb);
+    int const top      = static_cast<int>((rgb >> 24) & 0xffu);
+    std::uint32_t const lo = rgb & 0x00ffffffu;
+    int const effective = (method != 0) ? method : top;
+
+    if (effective == kColorMethodTruecolor) {
         return Color{
-            static_cast<std::uint8_t>((rgb >> 16) & 0xff),
-            static_cast<std::uint8_t>((rgb >>  8) & 0xff),
-            static_cast<std::uint8_t>( rgb        & 0xff),
+            static_cast<std::uint8_t>((lo >> 16) & 0xff),
+            static_cast<std::uint8_t>((lo >>  8) & 0xff),
+            static_cast<std::uint8_t>( lo        & 0xff),
             255,
         };
     }
-    if (method == kColorMethodAci) {
-        int const idx = static_cast<int>(c.index);
-        if (idx > 0 && idx != 7 && idx < 256) {
-            BITCODE_BL const packed = dwg_rgb_palette_index(
-                static_cast<BITCODE_BS>(idx));
-            return Color{
-                static_cast<std::uint8_t>((packed >> 16) & 0xff),
-                static_cast<std::uint8_t>((packed >>  8) & 0xff),
-                static_cast<std::uint8_t>( packed        & 0xff),
-                255,
-            };
-        }
+    if (effective == kColorMethodAci && lo != 0) {
+        return Color{
+            static_cast<std::uint8_t>((lo >> 16) & 0xff),
+            static_cast<std::uint8_t>((lo >>  8) & 0xff),
+            static_cast<std::uint8_t>( lo        & 0xff),
+            255,
+        };
+    }
+    int const idx = static_cast<int>(c.index);
+    if (idx > 0 && idx != 7 && idx < 256) {
+        BITCODE_BL const packed = dwg_rgb_palette_index(
+            static_cast<BITCODE_BS>(idx));
+        return Color{
+            static_cast<std::uint8_t>((packed >> 16) & 0xff),
+            static_cast<std::uint8_t>((packed >>  8) & 0xff),
+            static_cast<std::uint8_t>( packed        & 0xff),
+            255,
+        };
     }
     return Color{};
 }
@@ -1153,6 +1183,42 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             if (d == nullptr) { ++out.unknown_entities; break; }
             expand_block(dwg, d->block, xf, out);
             ++out.dimension_count;
+            break;
+        }
+        case DWG_TYPE_SOLID:
+        case DWG_TYPE_TRACE: {
+            // SOLID and TRACE both store a filled quadrilateral as four
+            // 2D corners. AutoCAD's emit order is (corner1, corner2,
+            // corner4, corner3) — corner3 and corner4 are diagonally
+            // opposite, so a literal 1-2-3-4 winding self-intersects.
+            // The two struct types are layout-identical at the prefix
+            // we need; read the corner fields through whichever pointer
+            // matches.
+            auto const* sol = obj->fixedtype == DWG_TYPE_SOLID
+                ? obj->tio.entity->tio.SOLID : nullptr;
+            auto const* tra = obj->fixedtype == DWG_TYPE_TRACE
+                ? obj->tio.entity->tio.TRACE : nullptr;
+            if (sol == nullptr && tra == nullptr) {
+                ++out.unknown_entities; break;
+            }
+            auto const& c1 = sol ? sol->corner1 : tra->corner1;
+            auto const& c2 = sol ? sol->corner2 : tra->corner2;
+            auto const& c3 = sol ? sol->corner3 : tra->corner3;
+            auto const& c4 = sol ? sol->corner4 : tra->corner4;
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            Hatch hatch{};
+            hatch.color      = meta.color;
+            hatch.layer_name = std::move(meta.layer_name);
+            hatch.solid      = true;
+            std::vector<Point> loop;
+            loop.reserve(4);
+            loop.push_back(xf.apply_point(c1.x, c1.y));
+            loop.push_back(xf.apply_point(c2.x, c2.y));
+            loop.push_back(xf.apply_point(c4.x, c4.y));
+            loop.push_back(xf.apply_point(c3.x, c3.y));
+            hatch.loops.push_back(std::move(loop));
+            out.hatches.push_back(std::move(hatch));
+            ++out.hatch_count;
             break;
         }
         case DWG_TYPE_HATCH: {
