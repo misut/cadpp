@@ -135,6 +135,92 @@ std::string read_text_field(Dwg_Data const* dwg, char const* raw) {
     return std::string{raw};
 }
 
+// Strip MTEXT inline formatting codes from a raw text value so the
+// renderer (which has no rich-text support) emits only the visible
+// characters. Without this, sheet titles in colorwh.dwg appear with a
+// literal "\L" prefix because that's the underline-on toggle from
+// AutoCAD's MTEXT mini-language.
+//
+// Codes handled (per AutoCAD's MTEXT format spec):
+//   \\, \{, \}, \~        - escaped literal / non-breaking space
+//   \P                    - paragraph break (emitted as '\n' even though
+//                           the renderer ignores it; future-proof)
+//   \L \l \O \o \K \k     - underline / overline / strikethrough toggles,
+//                           dropped (visual emphasis not yet supported)
+//   \fName...; \Cn;       - font / colour, dropped through trailing ';'
+//   \Hh; \Qq; \Tt;        - height / oblique / tracking, dropped
+//   \Wn; \An; \pN;        - width / alignment / paragraph props, dropped
+//   \S num ^ den ;        - stacked fraction; rendered as "num/den" so
+//                           the values stay visible without the formatter
+//   { ... }               - group brackets dropped (contents kept)
+//
+// Unknown `\X` escapes drop the backslash and keep the character — a
+// best-effort fallback that matches what most viewers do for forward
+// compatibility.
+std::string strip_mtext_format(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size(); ) {
+        char const c = in[i];
+        if (c == '\\') {
+            if (i + 1 >= in.size()) { out += c; ++i; continue; }
+            char const n = in[i + 1];
+            switch (n) {
+                case '\\': out += '\\'; i += 2; break;
+                case '{':  out += '{';  i += 2; break;
+                case '}':  out += '}';  i += 2; break;
+                case '~':  out += ' ';  i += 2; break;
+                case 'P':  out += '\n'; i += 2; break;
+                case 'L': case 'l':
+                case 'O': case 'o':
+                case 'K': case 'k':
+                    i += 2;
+                    break;
+                case 'S': {
+                    // \S<num>^<den>; — keep "num/den" for legibility.
+                    std::size_t j = i + 2;
+                    std::string num, den;
+                    while (j < in.size() && in[j] != '^' && in[j] != ';') {
+                        num += in[j++];
+                    }
+                    if (j < in.size() && in[j] == '^') {
+                        ++j;
+                        while (j < in.size() && in[j] != ';') den += in[j++];
+                    }
+                    if (j < in.size()) ++j; // consume ';'
+                    out += num;
+                    if (!den.empty()) { out += '/'; out += den; }
+                    i = j;
+                    break;
+                }
+                case 'f': case 'F':
+                case 'C': case 'c':
+                case 'H': case 'h':
+                case 'Q': case 'q':
+                case 'T': case 't':
+                case 'W': case 'w':
+                case 'A': case 'a':
+                case 'p': {
+                    std::size_t j = i + 2;
+                    while (j < in.size() && in[j] != ';') ++j;
+                    i = (j < in.size()) ? j + 1 : in.size();
+                    break;
+                }
+                default:
+                    out += n;
+                    i += 2;
+                    break;
+            }
+        } else if (c == '{' || c == '}') {
+            ++i;
+        } else {
+            out += c;
+            ++i;
+        }
+    }
+    return out;
+}
+
 EntityMetadata resolve_entity_metadata(Dwg_Data const* dwg,
                                        Dwg_Object_Entity const* ent) {
     EntityMetadata out{};
@@ -1019,7 +1105,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             out.texts.push_back(Text{
                 xf.apply_point(m->ins_pt.x, m->ins_pt.y),
                 m->text_height * xf.scale_factor(),
-                read_text_field(dwg, m->text),
+                strip_mtext_format(read_text_field(dwg, m->text)),
                 meta.color,
                 std::move(meta.layer_name),
                 ha, va,
