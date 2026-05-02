@@ -1593,13 +1593,19 @@ void extract(Dwg_Data* dwg, Dwg_Object const* obj, Entities& out) {
         auto const* lo = obj->tio.object->tio.LAYOUT;
         if (lo != nullptr && lo->layout_name != nullptr) {
             Layout layout{};
-            layout.name      = read_text_field(dwg, lo->layout_name);
-            layout.tab_order = static_cast<int>(lo->tab_order);
-            // Resolve the BLOCK_HEADER handle to its name. The Model
-            // layout's block-header is the file's `BLOCK_RECORD_MSPACE`;
-            // each paper-space sheet has its own `*PAPER_SPACEn` /
-            // `*Layoutn` block-header.
+            layout.name          = read_text_field(dwg, lo->layout_name);
+            layout.tab_order     = static_cast<int>(lo->tab_order);
+            layout.layout_handle = static_cast<std::uint64_t>(obj->handle.value);
+            // Resolve the BLOCK_HEADER handle. The Model layout points
+            // at the file's `BLOCK_RECORD_MSPACE`; paper-space sheets
+            // each own a distinct BLOCK_HEADER object — but in
+            // colorwh.dwg both paper-space sheets share the BH *name*
+            // `*Paper_Space` while owning different BH handles, so we
+            // record the absolute handle for unambiguous matching and
+            // keep the name only for diagnostics.
             if (lo->block_header != nullptr) {
+                layout.block_owner_handle =
+                    static_cast<std::uint64_t>(lo->block_header->absolute_ref);
                 Dwg_Object* bh_obj = dwg_ref_object(dwg, lo->block_header);
                 if (bh_obj != nullptr
                     && bh_obj->supertype == DWG_SUPERTYPE_OBJECT) {
@@ -1710,30 +1716,38 @@ Entities parse_file(std::string_view path,
     // layouts were resolved (malformed file or LibreDWG version that
     // doesn't expose LAYOUT objects), keeping pre-slab behaviour
     // intact for the regression matrix.
-    if (selected != nullptr && !selected->block_owner.empty()) {
+    if (selected != nullptr
+        && (selected->block_owner_handle != 0 || !selected->block_owner.empty())) {
         Dwg_Object_BLOCK_HEADER const* selected_bh = nullptr;
         Dwg_Object_BLOCK_HEADER const* model_bh    = nullptr;
+        // Match BLOCK_HEADERs by absolute handle when known. Two
+        // paper-space sheets in the same file can share the BH name
+        // (colorwh.dwg has two distinct `*Paper_Space` BHs for its two
+        // sheets) so name-based matching collapses them onto whichever
+        // is enumerated first — that was the bug. Fall back to name
+        // only if handle was not captured (older LibreDWG decode quirks).
+        std::uint64_t model_bh_handle = 0;
+        if (BITCODE_H mspace = dwg.header_vars.BLOCK_RECORD_MSPACE) {
+            model_bh_handle = static_cast<std::uint64_t>(mspace->absolute_ref);
+        }
         for (BITCODE_BL i = 0; i < num_objects; ++i) {
             Dwg_Object const* o = &dwg.object[i];
             if (o->supertype != DWG_SUPERTYPE_OBJECT) continue;
             if (static_cast<int>(o->fixedtype) != DWG_TYPE_BLOCK_HEADER) continue;
             auto const* bh = o->tio.object->tio.BLOCK_HEADER;
-            if (bh == nullptr || bh->name == nullptr) continue;
-            std::string const bh_name = read_text_field(&dwg, bh->name);
-            if (selected_bh == nullptr && bh_name == selected->block_owner) {
-                selected_bh = bh;
+            if (bh == nullptr) continue;
+            std::uint64_t const bh_handle =
+                static_cast<std::uint64_t>(o->handle.value);
+            if (selected_bh == nullptr) {
+                bool match = (selected->block_owner_handle != 0)
+                    ? (bh_handle == selected->block_owner_handle)
+                    : (bh->name != nullptr
+                        && read_text_field(&dwg, bh->name) == selected->block_owner);
+                if (match) selected_bh = bh;
             }
-            // The implicit Model layout's block-header is `*Model_Space`
-            // (or whichever name `BLOCK_RECORD_MSPACE` resolves to). We
-            // use the by-name match here because the layout walk in
-            // pass 1 already records that name on the Model layout.
-            if (model_bh == nullptr) {
-                for (auto const& lo : entities.layouts) {
-                    if (lo.is_model && bh_name == lo.block_owner) {
-                        model_bh = bh;
-                        break;
-                    }
-                }
+            if (model_bh == nullptr && model_bh_handle != 0
+                && bh_handle == model_bh_handle) {
+                model_bh = bh;
             }
             if (selected_bh != nullptr
                 && (model_bh != nullptr || selected->is_model)) {
@@ -1744,34 +1758,72 @@ Entities parse_file(std::string_view path,
             extract_layout_entities(&dwg, selected_bh, entities);
         }
         // Slab 9 — VIEWPORT-driven sheet rendering. For paper-space
-        // sheets, instead of layering the Model BLOCK_HEADER walk on
-        // top (the Slab-21 walk-both approximation), enumerate the
-        // sheet's own VIEWPORT entities and pull model content
-        // through each one's affine + clip rect. Replaces the prior
-        // walk-both behaviour that made Sheets render the same drawing
-        // as Model with the title block on top, with Autodesk Viewer's
-        // actual sheet behaviour (model content scaled + clipped per
-        // viewport).
+        // sheets, enumerate the sheet's own VIEWPORT entities (taken
+        // from its `Dwg_Object_LAYOUT::viewports[]` list, the DWG
+        // R2004+ field that records per-sheet viewport ownership) and
+        // pull model content through each one's affine + clip rect.
         //
-        // Falls back to the walk-both interim only when no VIEWPORTs
-        // were processed AND a Model block-header is available — covers
-        // files we haven't audited where LibreDWG fails to expose any
-        // decodable VIEWPORT inside the sheet's block-header.
+        // Earlier revisions iterated the sheet's BLOCK_HEADER entity
+        // array directly, but that mixes up sheets whenever LibreDWG
+        // resolves the wrong BH (two sheets sharing the same BH name
+        // — see colorwh.dwg) AND it brings in stray VIEWPORTs that
+        // belong to a sibling sheet but happen to land in the same
+        // BH after a name collision. Walking the LAYOUT's viewports[]
+        // bypasses both pitfalls.
+        //
+        // Status_flag bit reference (no LibreDWG constants — DXF docs):
+        // observed values 0x8060 mark the overall page-extents VP
+        // (skipped by `expand_viewport`'s identity-affine guard),
+        // 0xc020 / 0x18000 / 0x1c000 are content viewports.
+        //
+        // Falls back to active_viewport (R2000+) when viewports[] is
+        // empty (older DWG or LibreDWG decode gap), then to the legacy
+        // BLOCK_HEADER walk for files that expose neither, and finally
+        // to walk-both when no VIEWPORT was expanded at all.
         if (!selected->is_model && selected_bh != nullptr
             && model_bh != nullptr && model_bh != selected_bh) {
             unsigned int const before = entities.viewport_count;
-            for (BITCODE_BL i = 0; i < selected_bh->num_owned; ++i) {
-                BITCODE_H href = selected_bh->entities[i];
-                if (href == nullptr) continue;
+
+            Dwg_Object_LAYOUT const* layout_obj = nullptr;
+            if (selected->layout_handle != 0) {
+                for (BITCODE_BL i = 0; i < num_objects; ++i) {
+                    Dwg_Object const* o = &dwg.object[i];
+                    if (o->supertype != DWG_SUPERTYPE_OBJECT) continue;
+                    if (static_cast<int>(o->fixedtype) != DWG_TYPE_LAYOUT) continue;
+                    if (static_cast<std::uint64_t>(o->handle.value)
+                        != selected->layout_handle) continue;
+                    layout_obj = o->tio.object->tio.LAYOUT;
+                    break;
+                }
+            }
+
+            auto expand_handle = [&](BITCODE_H href) {
+                if (href == nullptr) return;
                 Dwg_Object* eobj = dwg_ref_object(&dwg, href);
-                if (eobj == nullptr) continue;
-                if (eobj->supertype != DWG_SUPERTYPE_ENTITY) continue;
-                if (static_cast<int>(eobj->fixedtype)
-                    != DWG_TYPE_VIEWPORT) continue;
+                if (eobj == nullptr) return;
+                if (eobj->supertype != DWG_SUPERTYPE_ENTITY) return;
+                if (static_cast<int>(eobj->fixedtype) != DWG_TYPE_VIEWPORT) return;
                 auto const* vp = eobj->tio.entity->tio.VIEWPORT;
                 expand_viewport(&dwg, vp, model_bh,
                                 Affine::identity(), entities);
+            };
+
+            if (layout_obj != nullptr && layout_obj->viewports != nullptr
+                && layout_obj->num_viewports > 0) {
+                for (BITCODE_BL i = 0; i < layout_obj->num_viewports; ++i) {
+                    expand_handle(layout_obj->viewports[i]);
+                }
+            } else {
+                if (layout_obj != nullptr && layout_obj->active_viewport != nullptr) {
+                    expand_handle(layout_obj->active_viewport);
+                }
+                if (entities.viewport_count == before) {
+                    for (BITCODE_BL i = 0; i < selected_bh->num_owned; ++i) {
+                        expand_handle(selected_bh->entities[i]);
+                    }
+                }
             }
+
             // Walk-both fallback: only when zero VIEWPORTs were
             // expanded for the sheet (none decoded, all skipped, or
             // sheet truly has no viewports).

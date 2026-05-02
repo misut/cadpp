@@ -222,11 +222,25 @@ struct Linetype {
 // `block_owner` carries the BLOCK_HEADER name (e.g. `*MODEL_SPACE`,
 // `*PAPER_SPACE`, `*Layout1`) whose entities make up this layout's
 // content; the parser uses it as the per-layout selection key.
+// `block_owner_handle` is the absolute handle (LibreDWG `BITCODE_RLL`,
+// stored as uint64) of the BLOCK_HEADER backing this layout. Required
+// because two paper-space sheets in the same file can share the BH
+// *name* (e.g. both `*Paper_Space`) — name-based lookup then collapses
+// them onto whichever BH is enumerated first, which is the colorwh.dwg
+// regression where the True Color sheet rendered the Color Index
+// sheet's viewports. Handle-based matching disambiguates them.
+//
+// `layout_handle` is the LAYOUT object's own absolute handle, used by
+// pass 2 to re-resolve the LAYOUT and walk its `viewports[]` list (the
+// DWG-defined per-sheet VIEWPORT ownership) instead of iterating every
+// entity inside the shared `*Paper_Space` block-header.
 struct Layout {
-    std::string name;          // user-visible (e.g. "Model", "True Color")
-    int         tab_order = 0; // DWG-defined ordering for the picker
-    bool        is_model  = false;
-    std::string block_owner;   // BLOCK_HEADER name owning this layout's entities
+    std::string         name;                  // user-visible (e.g. "Model", "True Color")
+    int                 tab_order = 0;         // DWG-defined ordering for the picker
+    bool                is_model  = false;
+    std::string         block_owner;           // BLOCK_HEADER name (legacy fallback / debug)
+    std::uint64_t       block_owner_handle = 0; // BLOCK_HEADER absolute handle, 0 = unknown
+    std::uint64_t       layout_handle      = 0; // LAYOUT object absolute handle, 0 = unknown
 };
 
 // Slab 2.a: parse a .dwg file into native draw primitives. CIRCLE
