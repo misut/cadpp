@@ -300,6 +300,72 @@ void render_view_panel(State const& state) {
 // lifetime issue with extracting it into a helper that returns a
 // lambda capturing a reference to the view's State parameter.
 namespace {
+
+// Compose phenotype's optional widget::canvas paint_token from every
+// State field the canvas painter actually reads. As long as the
+// returned uint64 is byte-stable across frames, phenotype reuses the
+// previous frame's emitted FillPath / DrawLine command stream and
+// skips canvas_painter entirely — collapsing the 36k-cmd HATCH dump
+// for colorwh.dwg (and similar large drawings) from a per-frame
+// re-emit to a single memcpy. Any input change (entity reload,
+// pan/zoom, layer toggle, view switch) advances the token, forcing
+// one fresh emit before the cache settles again.
+//
+// `0` is reserved by phenotype as "no token / always-dirty"; we
+// fold a 1 in if the natural hash collides with zero. Hash collision
+// risk is 1 in 2^64 per frame, which we accept — the cost of a stale
+// blit is at most one frame of stale entities until the next input
+// event.
+std::uint64_t hash_canvas_inputs(State const& state) noexcept {
+    auto mix = [](std::uint64_t h, std::uint64_t v) noexcept {
+        h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+        return h;
+    };
+    auto bits = [](double d) noexcept {
+        std::uint64_t u;
+        std::memcpy(&u, &d, sizeof(u));
+        return u;
+    };
+    std::uint64_t h = 0xCBF29CE484222325ULL;  // FNV offset basis
+    // Entity buffer identity. State::load() rebuilds entities in
+    // place — when the underlying std::vector storages relocate, the
+    // data() pointers flip; when sizes change, the counts flip. Both
+    // feed the hash so any reload advances the token.
+    auto vec_print = [&](auto const& v) noexcept {
+        h = mix(h, static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(v.data())));
+        h = mix(h, static_cast<std::uint64_t>(v.size()));
+    };
+    vec_print(state.entities.lines);
+    vec_print(state.entities.arcs);
+    vec_print(state.entities.bulged_polylines);
+    vec_print(state.entities.ellipses);
+    vec_print(state.entities.splines);
+    vec_print(state.entities.hatches);
+    vec_print(state.entities.texts);
+    h = mix(h, state.entities.ok ? 1ULL : 0ULL);
+    // Viewport transform: pan/zoom drives every numeric field.
+    auto const& t = state.transform;
+    h = mix(h, bits(t.scale));
+    h = mix(h, bits(t.pad_x));
+    h = mix(h, bits(t.pad_y));
+    h = mix(h, bits(t.bbox.min_x));
+    h = mix(h, bits(t.bbox.min_y));
+    h = mix(h, bits(t.bbox.max_x));
+    h = mix(h, bits(t.bbox.max_y));
+    // Selected layout name — drives entity filter at parse time.
+    for (char c : state.selected_layout)
+        h = mix(h, static_cast<std::uint64_t>(static_cast<unsigned char>(c)));
+    h = mix(h, 0xFEFEFEFEFEFEFEFEULL);  // sentinel between fields
+    // Layer visibility map.
+    for (auto const& [name, visible] : state.layer_visible) {
+        for (char c : name)
+            h = mix(h, static_cast<std::uint64_t>(static_cast<unsigned char>(c)));
+        h = mix(h, visible ? 1ULL : 2ULL);
+    }
+    return h == 0 ? 1ULL : h;
+}
+
 auto canvas_painter(State const& state) {
     return [&state](phenotype::Painter& p) {
         constexpr float kBorder = 2.0f;
@@ -351,7 +417,8 @@ void view(State const& state) {
             } else {
                 widget::canvas(kCanvasWidth, kCanvasHeight,
                                canvas_painter(state),
-                               &on_canvas_gesture);
+                               &on_canvas_gesture,
+                               hash_canvas_inputs(state));
                 widget::button<Msg>("Views", ToggleDrawer{},
                                     ButtonVariant::Default);
             }
@@ -371,7 +438,8 @@ void view(State const& state) {
                 }, SpaceToken::Md);
                 widget::canvas(kCanvasWidth, kCanvasHeight,
                                canvas_painter(state),
-                               &on_canvas_gesture);
+                               &on_canvas_gesture,
+                               hash_canvas_inputs(state));
             }, SpaceToken::Lg, CrossAxisAlignment::Start);
 #endif
         });
