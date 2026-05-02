@@ -35,6 +35,42 @@ struct BBox {
 
 inline BBox compute_bbox(Entities const& e) {
     BBox b;
+    // Sheet rendering: when paper-space VIEWPORTs were expanded, each
+    // emitted a Push clip marker carrying the viewport's paper-space
+    // rect. Using the union of those rects as the bbox keeps
+    // fit-on-load anchored to the visible paper area; otherwise
+    // compute_bbox below would walk every transformed model entity,
+    // and a single small content viewport (scale ~0.02 on
+    // colorwh.dwg) projects model points hundreds of paper-units
+    // away, blowing the bbox up to a region tens of times the actual
+    // sheet — fit-on-load then scales the real content down to a
+    // sliver of the canvas. Sheet entities (title block, decorations)
+    // already live in paper-space, and viewport content stays inside
+    // its own clip rect via Painter::push_clip, so the rect-union
+    // bound is both tighter and visually exact.
+    bool has_sheet_clip = false;
+    for (auto const& m : e.clip_markers) {
+        if (m.kind != ClipMarker::Kind::Push) continue;
+        if (m.w <= 0.0 || m.h <= 0.0) continue;
+        b.add(m.x, m.y);
+        b.add(m.x + m.w, m.y + m.h);
+        has_sheet_clip = true;
+    }
+    if (has_sheet_clip) {
+        // Also fold in any sheet-owned entities that may sit just
+        // outside the viewport rect union (title text, frame), so a
+        // title block above the rect cluster doesn't get cropped.
+        for (auto const& t : e.texts) {
+            b.add(t.position.x, t.position.y);
+            b.add(t.position.x, t.position.y + t.height);
+        }
+        for (auto const& l : e.lines) {
+            b.add(l.a.x, l.a.y);
+            b.add(l.b.x, l.b.y);
+        }
+        return b;
+    }
+
     for (auto const& l : e.lines) {
         b.add(l.a.x, l.a.y);
         b.add(l.b.x, l.b.y);

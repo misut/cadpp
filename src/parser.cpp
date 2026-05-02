@@ -736,12 +736,48 @@ void emit_clip_marker(Entities& out, ClipMarker::Kind kind,
 // degenerate / zero-extent rectangles. 3D viewports
 // (`VIEWDIR != (0,0,1)`) are rendered as 2D — flagged in the slab's
 // PR body as a known limitation.
+// Walk the VIEWPORT's `frozen_layers` handle list, resolve each to
+// its LAYER object, and collect the layer names into a set. Each
+// paper-space VIEWPORT can additionally freeze layers above and
+// beyond the document-global frozen flag, and Autodesk Viewer hides
+// the corresponding entities for that viewport. Without this filter,
+// cad++ would dump the full model through every viewport's affine —
+// which is exactly the regression where colorwh.dwg's True Color
+// sheet leaks the AutoCAD-Color-Index wheel into a content viewport
+// that Autodesk leaves blank.
+std::set<std::string> collect_viewport_frozen_layers(
+        Dwg_Data const* dwg,
+        Dwg_Entity_VIEWPORT const* vp) {
+    std::set<std::string> out;
+    if (vp == nullptr || vp->frozen_layers == nullptr) return out;
+    for (BITCODE_BL i = 0; i < vp->num_frozen_layers; ++i) {
+        BITCODE_H href = vp->frozen_layers[i];
+        if (href == nullptr) continue;
+        Dwg_Object* obj = dwg_ref_object(const_cast<Dwg_Data*>(dwg), href);
+        if (obj == nullptr) continue;
+        if (obj->supertype != DWG_SUPERTYPE_OBJECT) continue;
+        if (static_cast<int>(obj->fixedtype) != DWG_TYPE_LAYER) continue;
+        auto const* layer = obj->tio.object->tio.LAYER;
+        if (layer == nullptr || layer->name == nullptr) continue;
+        std::string name = read_text_field(dwg, layer->name);
+        if (!name.empty()) out.insert(std::move(name));
+    }
+    return out;
+}
+
 void expand_viewport(Dwg_Data* dwg,
                      Dwg_Entity_VIEWPORT const* vp,
                      Dwg_Object_BLOCK_HEADER const* model_bh,
                      Affine const& parent_xf, Entities& out) {
     if (vp == nullptr || model_bh == nullptr) return;
-    if (vp->on_off == 0) return;
+    // LibreDWG does not reliably populate `on_off` (observed as 0 on
+    // every VIEWPORT decoded out of colorwh.dwg, including ones that
+    // Autodesk Viewer renders fine), so trusting it as a "skip"
+    // signal is wrong — falls back to walk-both and the sheet gets
+    // the entire model laid over its own paper-space content. Treat
+    // the field as unreliable and rely on size / VIEWSIZE / id +
+    // identity-affine guards below instead.
+    //
     // The `overall` VIEWPORT (id 1) defines the page itself — not a
     // model-content viewport. Each Sheet has exactly one of these.
     if (vp->id == 1) return;
@@ -749,6 +785,23 @@ void expand_viewport(Dwg_Data* dwg,
     if (vp->VIEWSIZE <= 0.0) return;
 
     double const scale = vp->height / vp->VIEWSIZE;
+
+    // Skip identity-affine viewports — paper-space self-views where
+    // the centre matches VIEWCTR at scale 1 and zero twist. LibreDWG
+    // tends to leave a trailing "page extents" VIEWPORT alongside
+    // the proper content viewports, with id reported as 0 (so the
+    // id == 1 guard above doesn't cover it). Expanding it would dump
+    // the whole model laid over the sheet at its raw model coords —
+    // exactly the regression that left `colorwh.dwg`'s True Color
+    // sheet showing both wheels.
+    double const dcx = vp->center.x - vp->VIEWCTR.x;
+    double const dcy = vp->center.y - vp->VIEWCTR.y;
+    if (std::fabs(scale - 1.0) < 1e-6
+        && std::fabs(dcx) < 1e-6
+        && std::fabs(dcy) < 1e-6
+        && std::fabs(vp->twist_angle) < 1e-6) {
+        return;
+    }
 
     Affine const local =
         Affine::translate(vp->center.x, vp->center.y)
@@ -763,6 +816,8 @@ void expand_viewport(Dwg_Data* dwg,
     emit_clip_marker(out, ClipMarker::Kind::Push,
                      rect_x, rect_y, vp->width, vp->height);
 
+    auto const frozen = collect_viewport_frozen_layers(dwg, vp);
+
     if (model_bh->entities != nullptr) {
         for (BITCODE_BL i = 0; i < model_bh->num_owned; ++i) {
             BITCODE_H href = model_bh->entities[i];
@@ -770,6 +825,20 @@ void expand_viewport(Dwg_Data* dwg,
             Dwg_Object* child = dwg_ref_object(dwg, href);
             if (child == nullptr) continue;
             if (child->supertype != DWG_SUPERTYPE_ENTITY) continue;
+            // Filter per-viewport frozen layers. Each paper-space
+            // VIEWPORT freezes specific layers (its `frozen_layers`
+            // handle list) on top of the global frozen flag —
+            // Autodesk's True Color sheet uses this to keep its
+            // gradient-wheel viewport from also showing the AutoCAD
+            // Color Index wheel that lives elsewhere in model space.
+            if (!frozen.empty()) {
+                Dwg_Object_LAYER* layer =
+                    dwg_get_entity_layer(child->tio.entity);
+                if (layer != nullptr && layer->name != nullptr) {
+                    std::string name = read_text_field(dwg, layer->name);
+                    if (frozen.count(name) > 0) continue;
+                }
+            }
             extract_entity_xf(dwg, child, viewport_xf, out);
         }
     }
