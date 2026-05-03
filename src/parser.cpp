@@ -50,7 +50,13 @@ bool is_resolvable_cmc(Dwg_Color const& c) {
     if (effective == kColorMethodTruecolor) return true;
     if (effective == kColorMethodAci || effective == 0) {
         int const idx = static_cast<int>(c.index);
-        return idx > 0 && idx != 7 && idx < 256;
+        if (idx > 0 && idx != 7 && idx < 256) return true;
+        // Some LibreDWG paths leave `index` zero and bury the ACI
+        // index in the bottom byte of `rgb`. Treat that as resolvable
+        // too (color_from_cmc does the same fallback).
+        std::uint32_t const lo =
+            static_cast<unsigned>(c.rgb) & 0x00ffffffu;
+        if (lo > 0 && lo != 7 && lo < 256) return true;
     }
     return false;
 }
@@ -63,37 +69,60 @@ bool is_resolvable_cmc(Dwg_Color const& c) {
 //   1. Effective method TRUECOLOR → take the lower 24 bits of `rgb`
 //      directly (works for both explicit method=0xc3 and method=VOID
 //      with top-byte 0xc3).
-//   2. Effective method ACI with cached lower 24 bits in `rgb`
-//      (LibreDWG pre-resolves the palette for some entities) → use
-//      the cached RGB.
-//   3. Otherwise look up the ACI palette via `c.index`.
+//   2. Effective method ACI with `lo` carrying a real 24-bit RGB
+//      (some LibreDWG entity paths pre-resolve the palette) → use it
+//      directly. Detection: lo > 0xff and lo != index. For the common
+//      case where `lo` is just the raw ACI byte (== `c.index`, leaked
+//      from an unresolved cache), fall through to the palette lookup
+//      below — without this, layer-coloured LINEs and TEXTs render in
+//      `Color{0, 0, idx}` (e.g. ACI 1 → (0,0,1) instead of red).
+//   3. Otherwise look up the ACI palette via `c.index` (or `lo` as a
+//      last resort when the index field is missing).
 Color color_from_cmc(Dwg_Color const& c) {
     int const method = static_cast<int>(c.method);
     std::uint32_t const rgb = static_cast<std::uint32_t>(c.rgb);
     int const top      = static_cast<int>((rgb >> 24) & 0xffu);
     std::uint32_t const lo = rgb & 0x00ffffffu;
     int const effective = (method != 0) ? method : top;
-
-    if (effective == kColorMethodTruecolor) {
-        return Color{
-            static_cast<std::uint8_t>((lo >> 16) & 0xff),
-            static_cast<std::uint8_t>((lo >>  8) & 0xff),
-            static_cast<std::uint8_t>( lo        & 0xff),
-            255,
-        };
-    }
-    if (effective == kColorMethodAci && lo != 0) {
-        return Color{
-            static_cast<std::uint8_t>((lo >> 16) & 0xff),
-            static_cast<std::uint8_t>((lo >>  8) & 0xff),
-            static_cast<std::uint8_t>( lo        & 0xff),
-            255,
-        };
-    }
     int const idx = static_cast<int>(c.index);
-    if (idx > 0 && idx != 7 && idx < 256) {
+
+    // LibreDWG quirk: layer-color CMCs come in with method=TRUECOLOR
+    // but `rgb` low bytes hold the raw ACI index (e.g. rgb=0xc3000001
+    // for layer "Leader" → ACI 1 = red, NOT RGB (0,0,1)). The DXF
+    // FIELD_CMC reader stuffs the index there during decode and never
+    // resolves it. Detect: lo fits in a single byte → treat as ACI
+    // index and palette-lookup. Real truecolor RGBs at the same low
+    // value (0,0,N) for tiny N are theoretically possible but
+    // indistinguishable from this leak; collapse to ACI lookup since
+    // it's overwhelmingly the intent (ACI red is far more common in
+    // CAD layer styling than literal `(0,0,1)` truecolor).
+    if (effective == kColorMethodTruecolor && lo > 0xffu) {
+        return Color{
+            static_cast<std::uint8_t>((lo >> 16) & 0xff),
+            static_cast<std::uint8_t>((lo >>  8) & 0xff),
+            static_cast<std::uint8_t>( lo        & 0xff),
+            255,
+        };
+    }
+    // Pre-resolved RGB cache lives in lo for some ACI entity paths.
+    // Trust it only when lo can't be a leaked single-byte index.
+    if (effective == kColorMethodAci
+        && lo > 0xffu
+        && lo != static_cast<std::uint32_t>(idx)) {
+        return Color{
+            static_cast<std::uint8_t>((lo >> 16) & 0xff),
+            static_cast<std::uint8_t>((lo >>  8) & 0xff),
+            static_cast<std::uint8_t>( lo        & 0xff),
+            255,
+        };
+    }
+    int const palette_idx =
+        (idx > 0 && idx != 7 && idx < 256) ? idx
+        : (lo > 0 && lo < 256) ? static_cast<int>(lo)
+        : 0;
+    if (palette_idx > 0 && palette_idx != 7) {
         BITCODE_BL const packed = dwg_rgb_palette_index(
-            static_cast<BITCODE_BS>(idx));
+            static_cast<BITCODE_BS>(palette_idx));
         return Color{
             static_cast<std::uint8_t>((packed >> 16) & 0xff),
             static_cast<std::uint8_t>((packed >>  8) & 0xff),
@@ -135,11 +164,11 @@ std::string read_text_field(Dwg_Data const* dwg, char const* raw) {
     return std::string{raw};
 }
 
-// Strip MTEXT inline formatting codes from a raw text value so the
-// renderer (which has no rich-text support) emits only the visible
-// characters. Without this, sheet titles in colorwh.dwg appear with a
-// literal "\L" prefix because that's the underline-on toggle from
-// AutoCAD's MTEXT mini-language.
+// Parse MTEXT inline formatting codes into a flat plain-text string
+// PLUS a vector of styled runs that the renderer can walk run-by-run.
+// Without the runs view, the entire purpose of files like truetype.dwg
+// (each row uses `\f<face>;` to switch to the labelled face) is lost
+// and every sample renders in the entity's outer STYLE.
 //
 // Codes handled (per AutoCAD's MTEXT format spec):
 //   \\, \{, \}, \~        - escaped literal / non-breaking space
@@ -147,30 +176,206 @@ std::string read_text_field(Dwg_Data const* dwg, char const* raw) {
 //                           the renderer ignores it; future-proof)
 //   \L \l \O \o \K \k     - underline / overline / strikethrough toggles,
 //                           dropped (visual emphasis not yet supported)
-//   \fName...; \Cn;       - font / colour, dropped through trailing ';'
-//   \Hh; \Qq; \Tt;        - height / oblique / tracking, dropped
-//   \Wn; \An; \pN;        - width / alignment / paragraph props, dropped
+//   \fName|opts;          - font switch (face + bold/italic from opts)
+//   \Cn;                  - ACI colour index switch
+//   \Hh[x];               - height switch (`x` suffix → multiplier of
+//                           outer height; bare number → ignored, since
+//                           it is already in world units that we'd need
+//                           to divide by the outer entity height to use)
+//   \Qq; \Tt; \Wn; \An; \pN; - oblique / tracking / width / alignment
+//                              / paragraph props, dropped (visual
+//                              effect not yet plumbed)
 //   \S num ^ den ;        - stacked fraction; rendered as "num/den" so
 //                           the values stay visible without the formatter
-//   { ... }               - group brackets dropped (contents kept)
+//   { ... }               - group brackets push/pop the active style
+//                           so a `\f` inside the braces only affects
+//                           the bracketed text
 //
 // Unknown `\X` escapes drop the backslash and keep the character — a
 // best-effort fallback that matches what most viewers do for forward
 // compatibility.
-std::string strip_mtext_format(std::string_view in) {
-    std::string out;
-    out.reserve(in.size());
+struct MtextActiveStyle {
+    std::string family_override;
+    double      height_scale = 1.0;
+    Color       color_override{0, 0, 0, 0}; // a==0 → inherit
+    bool        bold_override   = false;
+    bool        italic_override = false;
+};
+
+// True if the active style differs from "no overrides at all" — drives
+// whether a flushed run gets pushed (we keep one bare run for the rest).
+bool style_has_overrides(MtextActiveStyle const& s) noexcept {
+    return !s.family_override.empty()
+        || s.height_scale != 1.0
+        || s.color_override.a != 0
+        || s.bold_override
+        || s.italic_override;
+}
+
+// Decode `\fName|b1|i0|c0|p34;` into a style change. The leading `\f`
+// has already been consumed; `body` is the substring up to (but not
+// including) the trailing `;`.
+void apply_font_switch(MtextActiveStyle& cur, std::string_view body) {
+    auto const bar = body.find('|');
+    cur.family_override = std::string{body.substr(0, bar)};
+    cur.bold_override   = false;
+    cur.italic_override = false;
+    if (bar == std::string_view::npos) return;
+    std::size_t i = bar;
+    while (i < body.size()) {
+        if (i + 1 < body.size() && body[i] == '|') {
+            char const tag = body[i + 1];
+            if ((tag == 'b' || tag == 'B') && i + 2 < body.size()) {
+                cur.bold_override = (body[i + 2] == '1');
+            } else if ((tag == 'i' || tag == 'I') && i + 2 < body.size()) {
+                cur.italic_override = (body[i + 2] == '1');
+            }
+        }
+        ++i;
+    }
+}
+
+// `\Hn;` (absolute world units, ignored — we'd need the outer height
+// to convert) vs `\Hn x;` (multiplier on outer). Returns the new
+// height_scale or the previous one if the code is malformed.
+double parse_height_change(std::string_view body, double previous) {
+    if (body.empty()) return previous;
+    bool const has_x = body.back() == 'x' || body.back() == 'X';
+    std::string_view const num = has_x ? body.substr(0, body.size() - 1) : body;
+    if (num.empty()) return previous;
+    char* end = nullptr;
+    std::string buf{num};
+    double const v = std::strtod(buf.c_str(), &end);
+    if (end == buf.c_str() || v <= 0.0) return previous;
+    return has_x ? v : previous;
+}
+
+Color parse_color_change(std::string_view body) {
+    if (body.empty()) return Color{0, 0, 0, 0};
+    int const idx = std::atoi(std::string{body}.c_str());
+    if (idx <= 0 || idx >= 256 || idx == 7) return Color{0, 0, 0, 0};
+    BITCODE_BL const packed = dwg_rgb_palette_index(
+        static_cast<BITCODE_BS>(idx));
+    return Color{
+        static_cast<std::uint8_t>((packed >> 16) & 0xff),
+        static_cast<std::uint8_t>((packed >>  8) & 0xff),
+        static_cast<std::uint8_t>( packed        & 0xff),
+        255,
+    };
+}
+
+struct MtextParseResult {
+    std::string flat;             // concatenation of every run's text
+    std::vector<TextRun> runs;    // populated only when overrides exist
+    std::vector<double> tab_stops; // world units from MTEXT left edge
+};
+
+// Parse the body of a `\p<...>;` paragraph-property code into any
+// tab-stop positions it carries. The MTEXT format encodes paragraph
+// properties as a comma-separated list of (key,value) pairs where the
+// key is a single letter:
+//   l<x>     — left indent (paragraph body x-offset)
+//   i<x>     — first-line indent
+//   t<x>     — tab stop position
+//   x<...>   — alignment / fill / etc (ignored)
+// `\pt<x1>,<x2>,...;` is the bare-multiple-stops form; `\pxt<x>,...;`
+// is functionally equivalent. Both feed into the same flat list. The
+// values are in world units relative to the MTEXT's left edge.
+//
+// Only TAB STOPS need to flow into the renderer to align this DWG —
+// indents come into play for paragraph reflow, which the current
+// renderer does not implement.
+void collect_tab_stops(std::string_view body, std::vector<double>& out) {
+    std::size_t i = 0;
+    auto skip_value = [&]() -> std::string_view {
+        std::size_t const start = i;
+        while (i < body.size() && body[i] != ',' && body[i] != ';') ++i;
+        return body.substr(start, i - start);
+    };
+    while (i < body.size()) {
+        char const c = body[i];
+        if (c == ',' || c == ';') { ++i; continue; }
+        // Skip leading 'x' qualifier ("\pxt..." vs "\pt...")
+        if (c == 'x' || c == 'X') { ++i; continue; }
+        char const key = c;
+        ++i;
+        auto const value = skip_value();
+        if (key == 't' || key == 'T') {
+            if (!value.empty()) {
+                char* end = nullptr;
+                std::string buf{value};
+                double const v = std::strtod(buf.c_str(), &end);
+                if (end != buf.c_str() && std::isfinite(v) && v > 0.0) {
+                    out.push_back(v);
+                }
+            }
+        }
+        // Other keys (l, i, q, etc.) are consumed and dropped — they
+        // either don't affect tab alignment or aren't yet rendered.
+    }
+}
+
+MtextParseResult parse_mtext_format(std::string_view in) {
+    MtextParseResult out;
+    out.flat.reserve(in.size());
+
+    MtextActiveStyle cur{};
+    std::vector<MtextActiveStyle> stack;
+    std::string buf;
+    bool any_overrides_seen = false;
+
+    auto flush_run = [&](bool force_push) {
+        if (buf.empty() && !force_push) return;
+        out.flat += buf;
+        // If we've never seen any override yet, defer pushing — the
+        // run vector stays empty so the renderer takes its existing
+        // single-style fast path. Once an override appears, every
+        // subsequent flush (including any preceding accumulated text)
+        // becomes a run so the timeline is preserved.
+        if (any_overrides_seen) {
+            out.runs.push_back(TextRun{
+                std::move(buf),
+                cur.family_override,
+                cur.height_scale,
+                cur.color_override,
+                cur.bold_override,
+                cur.italic_override,
+            });
+        }
+        buf.clear();
+    };
+
+    auto note_override_change = [&]() {
+        // Called immediately AFTER `cur` is mutated by an escape. If
+        // this is the first override we've seen, retroactively push
+        // any text accumulated under the no-override state so the
+        // run timeline starts at the right offset.
+        if (any_overrides_seen) {
+            flush_run(/*force_push=*/false);
+            return;
+        }
+        any_overrides_seen = true;
+        // Push the pre-override text as one bare run; without this the
+        // first switch would silently drop everything that came before
+        // it from the runs timeline (the flat string still has it).
+        if (!buf.empty()) {
+            out.flat += buf;
+            out.runs.push_back(TextRun{std::move(buf)});
+            buf.clear();
+        }
+    };
+
     for (std::size_t i = 0; i < in.size(); ) {
         char const c = in[i];
         if (c == '\\') {
-            if (i + 1 >= in.size()) { out += c; ++i; continue; }
+            if (i + 1 >= in.size()) { buf += c; ++i; continue; }
             char const n = in[i + 1];
             switch (n) {
-                case '\\': out += '\\'; i += 2; break;
-                case '{':  out += '{';  i += 2; break;
-                case '}':  out += '}';  i += 2; break;
-                case '~':  out += ' ';  i += 2; break;
-                case 'P':  out += '\n'; i += 2; break;
+                case '\\': buf += '\\'; i += 2; break;
+                case '{':  buf += '{';  i += 2; break;
+                case '}':  buf += '}';  i += 2; break;
+                case '~':  buf += ' ';  i += 2; break;
+                case 'P':  buf += '\n'; i += 2; break;
                 case 'L': case 'l':
                 case 'O': case 'o':
                 case 'K': case 'k':
@@ -188,35 +393,99 @@ std::string strip_mtext_format(std::string_view in) {
                         while (j < in.size() && in[j] != ';') den += in[j++];
                     }
                     if (j < in.size()) ++j; // consume ';'
-                    out += num;
-                    if (!den.empty()) { out += '/'; out += den; }
+                    buf += num;
+                    if (!den.empty()) { buf += '/'; buf += den; }
                     i = j;
                     break;
                 }
-                case 'f': case 'F':
-                case 'C': case 'c':
-                case 'H': case 'h':
+                case 'f': case 'F': {
+                    std::size_t j = i + 2;
+                    while (j < in.size() && in[j] != ';') ++j;
+                    auto const body = in.substr(i + 2, j - (i + 2));
+                    apply_font_switch(cur, body);
+                    note_override_change();
+                    i = (j < in.size()) ? j + 1 : in.size();
+                    break;
+                }
+                case 'C': case 'c': {
+                    std::size_t j = i + 2;
+                    while (j < in.size() && in[j] != ';') ++j;
+                    auto const body = in.substr(i + 2, j - (i + 2));
+                    cur.color_override = parse_color_change(body);
+                    note_override_change();
+                    i = (j < in.size()) ? j + 1 : in.size();
+                    break;
+                }
+                case 'H': case 'h': {
+                    std::size_t j = i + 2;
+                    while (j < in.size() && in[j] != ';') ++j;
+                    auto const body = in.substr(i + 2, j - (i + 2));
+                    cur.height_scale =
+                        parse_height_change(body, cur.height_scale);
+                    note_override_change();
+                    i = (j < in.size()) ? j + 1 : in.size();
+                    break;
+                }
                 case 'Q': case 'q':
                 case 'T': case 't':
                 case 'W': case 'w':
-                case 'A': case 'a':
-                case 'p': {
+                case 'A': case 'a': {
                     std::size_t j = i + 2;
                     while (j < in.size() && in[j] != ';') ++j;
                     i = (j < in.size()) ? j + 1 : in.size();
                     break;
                 }
+                case 'p': {
+                    // Paragraph properties — extract tab stops, then
+                    // drop the rest of the directive.
+                    std::size_t j = i + 2;
+                    while (j < in.size() && in[j] != ';') ++j;
+                    auto const body = in.substr(i + 2, j - (i + 2));
+                    collect_tab_stops(body, out.tab_stops);
+                    i = (j < in.size()) ? j + 1 : in.size();
+                    break;
+                }
                 default:
-                    out += n;
+                    buf += n;
                     i += 2;
                     break;
             }
-        } else if (c == '{' || c == '}') {
+        } else if (c == '{') {
+            // Save the active style so the matching `}` can restore it.
+            // Flush any pending text as a run before stacking; otherwise
+            // a switch-then-brace sequence would leak the inner style
+            // backward into the run that owned the pre-brace text.
+            if (any_overrides_seen) flush_run(/*force_push=*/false);
+            stack.push_back(cur);
+            ++i;
+        } else if (c == '}') {
+            if (!stack.empty()) {
+                if (any_overrides_seen) flush_run(/*force_push=*/false);
+                cur = stack.back();
+                stack.pop_back();
+            }
             ++i;
         } else {
-            out += c;
+            buf += c;
             ++i;
         }
+    }
+    // Final flush — push trailing text. Force-push only when overrides
+    // exist so the no-override path leaves out.runs empty.
+    flush_run(/*force_push=*/false);
+    // Sort + dedupe tab stops so the renderer can binary-search the
+    // next stop ahead of the cursor in O(log N). MTEXT bodies that
+    // re-set the same stop in every paragraph (truetype.dwg does this
+    // — every paragraph's `\pl<l>,t8.385;` re-emits the column) end
+    // up with duplicates otherwise.
+    if (!out.tab_stops.empty()) {
+        std::sort(out.tab_stops.begin(), out.tab_stops.end());
+        out.tab_stops.erase(
+            std::unique(out.tab_stops.begin(), out.tab_stops.end(),
+                        [](double a, double b) {
+                            return std::abs(a - b) < 1e-6;
+                        }),
+            out.tab_stops.end());
     }
     return out;
 }
@@ -1234,14 +1503,26 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (att == 4 || att == 5 || att == 6) ? TextVAlign::Middle :
                                                      TextVAlign::Bottom;
             Style style = resolve_entity_style(dwg, m->style);
+            auto parsed = parse_mtext_format(read_text_field(dwg, m->text));
+            double const lsf = (m->linespace_factor > 0.0)
+                ? m->linespace_factor : 1.0;
+            // Apply the entity-level scale factor to tab stops so they
+            // arrive at the renderer in the same world units the
+            // anchor / line advance use (matches what xf.apply_point
+            // does for positions).
+            double const scale = xf.scale_factor();
+            for (auto& s : parsed.tab_stops) s *= scale;
             out.texts.push_back(Text{
                 xf.apply_point(m->ins_pt.x, m->ins_pt.y),
-                m->text_height * xf.scale_factor(),
-                strip_mtext_format(read_text_field(dwg, m->text)),
+                m->text_height * scale,
+                std::move(parsed.flat),
                 meta.color,
                 std::move(meta.layer_name),
                 ha, va,
                 std::move(style),
+                std::move(parsed.runs),
+                lsf,
+                std::move(parsed.tab_stops),
             });
             ++out.text_count;
             break;
