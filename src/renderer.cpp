@@ -8,6 +8,7 @@
 // `import std` + `#include <cmath>` collision).
 
 #include "renderer.hpp"
+#include "fonts.hpp"
 
 namespace cadpp {
 
@@ -135,6 +136,26 @@ void render_lines(phenotype::Painter& p,
                          entities.lines.size(), transform);
 }
 
+// Resolve a per-run FontSpec, combining the entity's outer Style with
+// the run's optional overrides. Family always passes through the alias
+// table so SHX / Bitstream names resolve to host fonts.
+inline phenotype::FontSpec resolve_run_spec(Style const& outer,
+                                            TextRun const& r) {
+    std::string_view const fam_raw = r.family_override.empty()
+        ? std::string_view{outer.font_family}
+        : std::string_view{r.family_override};
+    std::string_view const aliased = alias_font_family(fam_raw);
+    std::string_view const family = aliased.empty() ? fam_raw : aliased;
+    bool const bold   = outer.bold   || r.bold_override;
+    bool const italic = outer.italic || r.italic_override;
+    return phenotype::FontSpec{
+        family,
+        bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
+        italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
+        false,
+    };
+}
+
 void render_texts(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform,
@@ -146,68 +167,262 @@ void render_texts(phenotype::Painter& p,
         auto const& t = entities.texts[ti];
         if (t.content.empty()) continue;
         if (!is_visible(visibility, t.layer_name)) continue;
-        float const font_px = static_cast<float>(t.height * transform.scale);
-        if (font_px < 4.0f) continue;  // below visual threshold; skip
+        float const outer_font_px =
+            static_cast<float>(t.height * transform.scale);
+        // Drop only truly sub-pixel runs — modern text backends
+        // (CoreText, DirectWrite, Skia) rasterise legibly down to
+        // ~1.5 px with built-in antialiasing, so the previous 4-px
+        // cut was hiding plenty of legible body copy on tightly-fit
+        // drawings (truetype.dwg, dimension labels at zoom-out).
+        if (outer_font_px < 1.5f) continue;
 
-        // Build the FontSpec from the entity's resolved STYLE.
-        phenotype::FontSpec font_spec{
-            std::string_view{t.style.font_family},
-            t.style.bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
-            t.style.italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
-            false,
+        // Two-pass walk over the entity's content. Pass 1 measures
+        // per-line widths + max heights into `line_widths` /
+        // `line_heights`; pass 2 emits draw calls using those numbers
+        // for h/v anchoring. Built around plain `vector<float>` /
+        // `vector<size_t>` only — vectors of locally-defined structs
+        // collide with libc++'s aligned-new overload set under
+        // `import std;` (the same trap the file-header comment warns
+        // about for `<cmath>`).
+        std::vector<float> line_widths;
+        std::vector<float> line_heights;
+        std::vector<float> seg_measured;  // one entry per visible segment
+
+        auto walk = [&](auto on_segment) {
+            std::size_t li = 0;
+            auto bump_line = [&]() {
+                ++li;
+                if (li >= line_widths.size()) {
+                    line_widths.resize(li + 1, 0.0f);
+                    line_heights.resize(li + 1, 0.0f);
+                }
+            };
+            auto emit_run_text = [&](std::string_view text, float font_px,
+                                     phenotype::FontSpec const& spec,
+                                     phenotype::Color paint) {
+                std::string_view rest = text;
+                while (!rest.empty()) {
+                    // Find the next break (newline or tab) — splitting
+                    // at both lets the renderer (a) bump line index on
+                    // \n, and (b) emit a tab marker the second pass
+                    // can use to advance the line cursor to the next
+                    // tab stop without consuming any visible glyphs.
+                    auto const nl  = rest.find('\n');
+                    auto const tab = rest.find('\t');
+                    auto const next = std::min(nl, tab);
+                    std::string_view const piece =
+                        (next == std::string_view::npos) ? rest : rest.substr(0, next);
+                    if (!piece.empty()) {
+                        on_segment(li, piece, font_px, spec, paint);
+                    }
+                    if (next == std::string_view::npos) break;
+                    char const brk = rest[next];
+                    if (brk == '\n') {
+                        bump_line();
+                    } else { // '\t'
+                        // Emit a sentinel tab segment with empty text;
+                        // pass 1 records 0 measured + bumps tab counter,
+                        // pass 2 advances cursor to next tab stop.
+                        on_segment(li, std::string_view{},
+                                   font_px, spec, paint);
+                    }
+                    rest = rest.substr(next + 1);
+                }
+            };
+            // Seed line 0 in the metrics arrays so on_segment can index
+            // into them on the very first segment.
+            if (line_widths.empty()) {
+                line_widths.push_back(0.0f);
+                line_heights.push_back(0.0f);
+            }
+            if (t.runs.empty()) {
+                std::string_view const alias =
+                    alias_font_family(t.style.font_family);
+                std::string_view const family =
+                    alias.empty() ? std::string_view{t.style.font_family} : alias;
+                phenotype::FontSpec const spec{
+                    family,
+                    t.style.bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
+                    t.style.italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
+                    false,
+                };
+                emit_run_text(t.content, outer_font_px, spec, to_paint(t.color));
+            } else {
+                for (auto const& r : t.runs) {
+                    float const run_font_px = static_cast<float>(
+                        t.height * r.height_scale * transform.scale);
+                    if (run_font_px < 1.5f) {
+                        // Still advance line index past any newlines so
+                        // a sub-pixel run does not collapse subsequent
+                        // visible runs onto the wrong line.
+                        for (char c : r.text) if (c == '\n') bump_line();
+                        continue;
+                    }
+                    phenotype::FontSpec const spec = resolve_run_spec(t.style, r);
+                    Color const color = (r.color_override.a != 0)
+                        ? r.color_override : t.color;
+                    phenotype::Color const paint = to_paint(color);
+                    emit_run_text(r.text, run_font_px, spec, paint);
+                }
+            }
         };
 
-        // Pixel-perfect run width via phenotype's measure_text. Falls
-        // back to the heuristic em-width LUT when the host can't
-        // measure (returns 0 / NaN) — keeps alignment usable on test
-        // hosts that wire up a stub measurer.
-        float measured = p.measure_text(
-            t.content.data(),
-            static_cast<unsigned int>(t.content.size()),
-            font_px, font_spec);
-        float const approx_w = (measured > 0.0f && std::isfinite(measured))
-            ? measured
-            : font_px * text_advance_em(t.content.data(), t.content.size());
-
-        // DWG anchor (`t.position`) lives at the baseline / Aligned
-        // corner per the entity's H/V alignment. Convert to the
-        // top-left phenotype expects:
+        // MTEXT tab advance — jump to the RIGHTMOST defined paragraph
+        // tab stop (`\pl<l>,t<x>;` / `\pt<x>;`) that is still strictly
+        // greater than the current line cursor. Matches Autodesk
+        // Viewer's behaviour on truetype.dwg: where multiple stops are
+        // defined per paragraph, the *last* one is the intended sample
+        // column and the earlier ones are alternates that AutoCAD
+        // skips through to land at the canonical alignment. Strict
+        // "first stop > current" would split the sample column across
+        // sections (Outline → 7.188, Monospace → 6.000, Regular →
+        // 8.385) and break the visual alignment Autodesk Viewer keeps.
         //
-        //   - Horizontal: subtract 0/half/full of the run width to
-        //     turn left/centre/right anchors into a left-anchor;
-        //     "Middle" is the visual centre and uses half-width too.
-        //   - Vertical: phenotype's anchor is the top of the font-size
-        //     box, so push the y down by 0/half/full font height
-        //     depending on whether the DWG anchor was baseline /
-        //     bottom / middle / top.
+        // When the cursor is past the last defined stop (e.g.
+        // ISOCTEUR's `\t\t` after a single `t7.2;` directive), extend
+        // the column grid with a default interval — average spacing
+        // between defined stops if there are ≥2, otherwise a fixed
+        // 1.2 world-unit fallback (matches the typical column gap in
+        // truetype.dwg's right column). Tab then degrades to a no-op
+        // only when the cursor already overshoots the extended grid
+        // by a full interval, never moving glyphs leftward.
+        auto tab_advance = [&](float current_offset) -> float {
+            if (t.tab_stops.empty()) return 0.0f;
+            float chosen = -1.0f;
+            for (double s : t.tab_stops) {
+                float const stop = static_cast<float>(s) * transform.scale;
+                if (stop > current_offset) chosen = stop;
+            }
+            if (chosen >= 0.0f) return chosen - current_offset;
+            // Past all defined stops — extend by default interval.
+            float const last =
+                static_cast<float>(t.tab_stops.back()) * transform.scale;
+            float interval = 1.2f * transform.scale;
+            if (t.tab_stops.size() >= 2) {
+                interval = static_cast<float>(
+                    t.tab_stops.back() - t.tab_stops.front())
+                    * transform.scale
+                    / static_cast<float>(t.tab_stops.size() - 1);
+            }
+            float const past_last = current_offset - last;
+            float const steps = std::floor(past_last / interval) + 1.0f;
+            return last + steps * interval - current_offset;
+        };
+
+        // Pass 1: measure + accumulate per-line metrics. Empty `piece`
+        // = TAB sentinel emitted by the splitter — advance to the
+        // next defined tab stop (or default-extended grid past the
+        // last stop) instead of measuring glyphs.
+        walk([&](std::size_t li, std::string_view piece, float font_px,
+                 phenotype::FontSpec const& spec, phenotype::Color) {
+            float measured;
+            if (piece.empty()) {
+                measured = tab_advance(line_widths[li]);
+            } else {
+                measured = p.measure_text(
+                    piece.data(), static_cast<unsigned int>(piece.size()),
+                    font_px, spec);
+                if (!(measured > 0.0f && std::isfinite(measured))) {
+                    measured = font_px * text_advance_em(piece.data(), piece.size());
+                }
+            }
+            seg_measured.push_back(measured);
+            line_widths[li]  += measured;
+            if (font_px > line_heights[li]) line_heights[li] = font_px;
+        });
+
+        if (line_widths.empty() || seg_measured.empty()) continue;
+        for (auto& h : line_heights) {
+            if (h == 0.0f) h = outer_font_px;
+        }
+        // Per-line vertical advance. Calibrated against truetype.dwg:
+        // entity[1] reports `extents_height = 21.736` with 57 `\n` in
+        // its flat content (58 rows in our `\n`-counting), so per-row
+        // advance = 21.736 / 58 ≈ 0.375 — exactly `text_height × 1.25
+        // × linespace_factor` for `text_height = 0.3` and
+        // `linespace_factor = 1.0`. The 1.25 multiplier lines up the
+        // body MTEXT rows with the separate LINE separator entities
+        // that the same DWG draws across each font row. Plain TEXT
+        // (runs empty, single line) reduces to font_px since the loop
+        // below max()es against the per-line height.
+        float const default_advance =
+            outer_font_px * 1.25f * static_cast<float>(t.line_spacing);
+        std::vector<float> line_advances(line_heights.size(), 0.0f);
+        for (std::size_t li = 0; li < line_heights.size(); ++li) {
+            // Most rows use the entity-wide advance. If a single run on
+            // the line is taller than the default leading would cover
+            // (rare — `\H`-scaled-up runs), fall back to the line's
+            // own max so glyphs don't overlap into the next row.
+            line_advances[li] = std::max(default_advance, line_heights[li]);
+        }
+        float total_height = 0.0f;
+        for (float a : line_advances) total_height += a;
+
         auto const anchor_canvas =
             transform.apply(t.position.x, t.position.y);
-        float ax = static_cast<float>(anchor_canvas.x);
-        float ay = static_cast<float>(anchor_canvas.y);
+        float const anchor_x = static_cast<float>(anchor_canvas.x);
+        float const anchor_y = static_cast<float>(anchor_canvas.y);
 
-        switch (t.h_align) {
-        case TextHAlign::Left:                       break;
-        case TextHAlign::Center: ax -= approx_w * 0.5f; break;
-        case TextHAlign::Middle: ax -= approx_w * 0.5f; break;
-        case TextHAlign::Right:  ax -= approx_w;        break;
-        }
-
-        // Canvas y grows downward. For Baseline (CAD default), the
-        // visible glyph sits ABOVE the anchor, so the top-left is
-        // `anchor_y - font_px`. Other anchors mirror that — Bottom is
-        // the same as Baseline modulo descender; Middle is half a
-        // font-height up; Top means the anchor is already at the top.
+        // V-anchor: pick the top-y of the entire text block. CAD's
+        // Baseline / Bottom anchor sits below the text (matching the
+        // single-line path's `ay -= font_px`); Middle puts the
+        // visual centre of the block at the anchor; Top puts the top
+        // edge there.
+        //
+        // `cap_offset` accounts for the gap between AutoCAD's bounding-
+        // rect top (≈ cap-top of row 0) and phenotype's font_size box
+        // top — phenotype.text(x, y) puts the FONT BOX top at y, but
+        // the visible glyph cap-top is below that by the font's
+        // internal leading. Calibrated against truetype.dwg: row
+        // baselines line up with separator-LINE y values when the
+        // body is shifted down by half the outer text height.
+        float const cap_offset = outer_font_px * 0.5f;
+        float top_y = anchor_y;
         switch (t.v_align) {
         case TextVAlign::Baseline:
-        case TextVAlign::Bottom:  ay -= font_px;        break;
-        case TextVAlign::Middle:  ay -= font_px * 0.5f; break;
-        case TextVAlign::Top:                           break;
+        case TextVAlign::Bottom:  top_y = anchor_y - total_height;        break;
+        case TextVAlign::Middle:  top_y = anchor_y - total_height * 0.5f; break;
+        case TextVAlign::Top:     top_y = anchor_y + cap_offset;          break;
         }
 
-        p.text(ax, ay,
-               t.content.data(),
-               static_cast<unsigned int>(t.content.size()),
-               font_px, to_paint(t.color), font_spec);
+        // Pre-compute per-line top y and per-line starting x (h-anchor).
+        std::vector<float> line_top_ys(line_widths.size(), 0.0f);
+        std::vector<float> line_start_xs(line_widths.size(), 0.0f);
+        {
+            float cumulative = top_y;
+            for (std::size_t li = 0; li < line_widths.size(); ++li) {
+                line_top_ys[li] = cumulative;
+                cumulative += line_advances[li];
+                float lx = anchor_x;
+                switch (t.h_align) {
+                case TextHAlign::Left:                                  break;
+                case TextHAlign::Center: lx -= line_widths[li] * 0.5f;  break;
+                case TextHAlign::Middle: lx -= line_widths[li] * 0.5f;  break;
+                case TextHAlign::Right:  lx -= line_widths[li];         break;
+                }
+                line_start_xs[li] = lx;
+            }
+        }
+
+        // Pass 2: emit draws. seg_measured indexed in the same visit
+        // order as pass 1 so each on_segment call consumes its own
+        // pre-computed measured width. Empty `piece` = TAB sentinel —
+        // skip the draw call but still advance the cursor.
+        std::vector<float> line_x_cursor = line_start_xs;
+        std::size_t mi = 0;
+        walk([&](std::size_t li, std::string_view piece, float font_px,
+                 phenotype::FontSpec const& spec, phenotype::Color color) {
+            float const measured = seg_measured[mi++];
+            if (!piece.empty()) {
+                // Bottom-align segments within the line so a tall and
+                // a short run on the same line share a baseline-ish y.
+                float const seg_y = line_top_ys[li] + (line_heights[li] - font_px);
+                p.text(line_x_cursor[li], seg_y,
+                       piece.data(), static_cast<unsigned int>(piece.size()),
+                       font_px, color, spec);
+            }
+            line_x_cursor[li] += measured;
+        });
     }
     process_clip_markers(p, entities.clip_markers, cursor,
                          &ClipMarker::texts_idx,

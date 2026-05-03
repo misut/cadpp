@@ -76,6 +76,30 @@ struct Style {
     bool         italic = false;
 };
 
+// One inline-styled segment of an MTEXT body. Populated when
+// `parse_mtext_format` sees `\f<face>;`, `\C<n>;`, or `\H<n[x]>;`
+// switches and needs to express that the next chunk of text uses a
+// face / colour / size different from the entity's outer STYLE. Plain
+// TEXT and MTEXT bodies that only contain literal characters leave
+// `Text::runs` empty so the renderer's existing single-style fast path
+// stays unchanged.
+//
+// `family_override` is the post-parse family token (no extension /
+// weight suffix) — feed it through the renderer's font-alias step the
+// same way `Text::style.font_family` is. `height_scale` multiplies the
+// outer entity height (`\H1.5x;` → 1.5; `\H0.3;` is rare and treated
+// as absolute world units / outer height when present without `x`).
+// `color_override.a == 0` → inherit `Text::color`; otherwise use as-is
+// (alpha defaults to 255 when AutoCAD colour-index codes resolve).
+struct TextRun {
+    std::string text;                    // UTF-8 segment, post-decode
+    std::string family_override;         // empty → inherit Text::style
+    double      height_scale = 1.0;      // multiplier on outer height
+    Color       color_override{0, 0, 0, 0};
+    bool        bold_override   = false; // logical OR over Text::style.bold
+    bool        italic_override = false;
+};
+
 struct Text {
     Point position;        // CAD coords — anchor point per (h_align, v_align)
     double height = 0.0;   // CAD units (font height in world space)
@@ -87,6 +111,26 @@ struct Text {
     // Resolved STYLE handle data — empty Style{} when the TEXT/MTEXT
     // entity has no STYLE handle or the handle could not be resolved.
     Style style;
+    // Optional inline-styled runs from MTEXT format codes. Empty
+    // means "no inline overrides" — the renderer draws `content` as
+    // a single styled block. When non-empty, the runs are the
+    // ground truth and `content` is the flattened concatenation kept
+    // for diagnostics / search.
+    std::vector<TextRun> runs;
+    // MTEXT line spacing factor (DXF 44, range 0.25–4.0). Multiplied
+    // against AutoCAD's "3-on-5" default leading (5/3 of `height`)
+    // to produce the per-line vertical advance in world units. 0 →
+    // treat as 1.0 (default). Plain TEXT entities leave it at 1.0.
+    double line_spacing = 1.0;
+    // MTEXT paragraph tab stops in world units, measured from the
+    // MTEXT's left edge (ins_pt.x). Extracted from inline `\pt<x>;`
+    // / `\pxt<x>;` / `\pl<l>,t<x>;` paragraph-property codes. Empty
+    // for plain TEXT and for MTEXT bodies that use no tabs. The
+    // renderer consumes a tab stop per literal `\t` in the content,
+    // advancing the line's x cursor to the matching world position
+    // so multi-row labels share a column even when the labels
+    // themselves vary in width.
+    std::vector<double> tab_stops;
 };
 
 // CIRCLE and ARC entities, kept as native arcs so the renderer can
