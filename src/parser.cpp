@@ -904,6 +904,87 @@ void expand_viewport(Dwg_Data* dwg,
 
     auto const frozen = collect_viewport_frozen_layers(dwg, vp);
 
+    // Round / non-rectangular viewports carry a `clip_boundary` handle
+    // pointing at the entity that defines the actual clip path
+    // (CIRCLE for colorwh.dwg's gradient wheel, ELLIPSE / LWPOLYLINE
+    // for other shapes). phenotype's Painter only takes a rectangular
+    // clip rect, so we can't pass the path through directly — instead
+    // we cull individual model-space entities whose primary reference
+    // point falls outside the boundary, leaving the rectangular clip
+    // marker as the visible-area envelope. This eliminates the
+    // characteristic over-render in the four corners of round
+    // viewports without touching the renderer or phenotype.
+    //
+    // CIRCLE-only first cut. ELLIPSE / polyline boundaries are rarer
+    // and route through the existing rect clip until we add
+    // path-based cull. HATCH entities are also exempt because their
+    // boundary may legitimately span both sides of the clip while the
+    // resulting fill stays inside (and they're how the wheel itself
+    // is drawn).
+    bool   has_circle_clip = false;
+    double clip_cx = 0.0, clip_cy = 0.0, clip_r2 = 0.0;
+    if (vp->clip_boundary != nullptr) {
+        Dwg_Object* cb = dwg_ref_object(dwg, vp->clip_boundary);
+        if (cb != nullptr
+            && cb->supertype == DWG_SUPERTYPE_ENTITY
+            && static_cast<int>(cb->fixedtype) == DWG_TYPE_CIRCLE) {
+            auto const* circ = cb->tio.entity->tio.CIRCLE;
+            if (circ != nullptr && circ->radius > 0.0) {
+                clip_cx = circ->center.x;
+                clip_cy = circ->center.y;
+                clip_r2 = circ->radius * circ->radius;
+                has_circle_clip = true;
+            }
+        }
+    }
+
+    auto entity_ref_pt = [](Dwg_Object const* eobj,
+                            double& mx, double& my) -> bool {
+        if (eobj == nullptr || eobj->supertype != DWG_SUPERTYPE_ENTITY) {
+            return false;
+        }
+        auto* ent = eobj->tio.entity;
+        if (ent == nullptr) return false;
+        switch (static_cast<int>(eobj->fixedtype)) {
+            case DWG_TYPE_LINE: { auto* e = ent->tio.LINE;
+                if (!e) return false; mx = e->start.x; my = e->start.y; return true; }
+            case DWG_TYPE_CIRCLE: { auto* e = ent->tio.CIRCLE;
+                if (!e) return false; mx = e->center.x; my = e->center.y; return true; }
+            case DWG_TYPE_ARC: { auto* e = ent->tio.ARC;
+                if (!e) return false; mx = e->center.x; my = e->center.y; return true; }
+            case DWG_TYPE_TEXT: { auto* e = ent->tio.TEXT;
+                if (!e) return false; mx = e->ins_pt.x; my = e->ins_pt.y; return true; }
+            case DWG_TYPE_MTEXT: { auto* e = ent->tio.MTEXT;
+                if (!e) return false; mx = e->ins_pt.x; my = e->ins_pt.y; return true; }
+            case DWG_TYPE_INSERT: { auto* e = ent->tio.INSERT;
+                if (!e) return false; mx = e->ins_pt.x; my = e->ins_pt.y; return true; }
+            case DWG_TYPE_LWPOLYLINE: { auto* e = ent->tio.LWPOLYLINE;
+                if (!e || e->num_points == 0 || !e->points) return false;
+                mx = e->points[0].x; my = e->points[0].y; return true; }
+            case DWG_TYPE_ELLIPSE: { auto* e = ent->tio.ELLIPSE;
+                if (!e) return false; mx = e->center.x; my = e->center.y; return true; }
+            // SOLID / TRACE quads. colorwh.dwg's True Color wheel is
+            // composed of ~36k SOLID quads (one per gradient cell), so
+            // missing this case left ~6k cells outside the wheel circle
+            // visible as the "extra rendered area" past the wheel edge.
+            case DWG_TYPE_SOLID: { auto* e = ent->tio.SOLID;
+                if (!e) return false; mx = e->corner1.x; my = e->corner1.y; return true; }
+            case DWG_TYPE_TRACE: { auto* e = ent->tio.TRACE;
+                if (!e) return false; mx = e->corner1.x; my = e->corner1.y; return true; }
+        }
+        return false; // unknown / HATCH / other — don't cull
+    };
+
+    auto inside_circle_clip = [&](Dwg_Object const* eobj) -> bool {
+        if (!has_circle_clip) return true;
+        double mx = 0.0, my = 0.0;
+        if (!entity_ref_pt(eobj, mx, my)) return true;
+        Point const p = viewport_xf.apply_point(mx, my);
+        double const dx = p.x - clip_cx;
+        double const dy = p.y - clip_cy;
+        return (dx * dx + dy * dy) <= clip_r2;
+    };
+
     if (model_bh->entities != nullptr) {
         for (BITCODE_BL i = 0; i < model_bh->num_owned; ++i) {
             BITCODE_H href = model_bh->entities[i];
@@ -925,6 +1006,7 @@ void expand_viewport(Dwg_Data* dwg,
                     if (frozen.count(name) > 0) continue;
                 }
             }
+            if (!inside_circle_clip(child)) continue;
             extract_entity_xf(dwg, child, viewport_xf, out);
         }
     }
