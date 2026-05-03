@@ -33,21 +33,48 @@ struct BBox {
     double height() const { return max_y - min_y; }
 };
 
+// Walk `v` and call `fn(item, index)` only for items whose index lies
+// outside every active push/pop clip pair encoded in `cm`. The marker
+// stream is shared across all entity types — each marker carries a
+// per-type cursor index (e.g. `lines_idx`) telling at which item the
+// push or pop takes effect. Mirrors `process_clip_markers` in the
+// renderer so bbox sees the same partition the painter does.
+template <typename Vec, typename Fn>
+inline void for_each_outside_clip(
+        Vec const& v,
+        std::vector<ClipMarker> const& cm,
+        std::size_t ClipMarker::* idx_field,
+        Fn fn) {
+    std::size_t cursor = 0;
+    int depth = 0;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        while (cursor < cm.size() && (cm[cursor].*idx_field) <= i) {
+            if (cm[cursor].kind == ClipMarker::Kind::Push) {
+                ++depth;
+            } else if (depth > 0) {
+                --depth;
+            }
+            ++cursor;
+        }
+        if (depth == 0) fn(v[i], i);
+    }
+}
+
 inline BBox compute_bbox(Entities const& e) {
     BBox b;
     // Sheet rendering: when paper-space VIEWPORTs were expanded, each
     // emitted a Push clip marker carrying the viewport's paper-space
-    // rect. Using the union of those rects as the bbox keeps
-    // fit-on-load anchored to the visible paper area; otherwise
-    // compute_bbox below would walk every transformed model entity,
-    // and a single small content viewport (scale ~0.02 on
-    // colorwh.dwg) projects model points hundreds of paper-units
-    // away, blowing the bbox up to a region tens of times the actual
-    // sheet — fit-on-load then scales the real content down to a
-    // sliver of the canvas. Sheet entities (title block, decorations)
-    // already live in paper-space, and viewport content stays inside
-    // its own clip rect via Painter::push_clip, so the rect-union
-    // bound is both tighter and visually exact.
+    // rect. The bbox is the union of those rects PLUS the sheet-owned
+    // (outside-any-clip) entities — title blocks, frames, page
+    // decorations. Entities emitted inside a clip are model-space
+    // points pushed through the viewport's affine: their transformed
+    // paper-space coordinates can drift off the viewport rect, so
+    // including them tilts the bbox sideways and breaks fit-to-canvas
+    // centring (this was the colorwh.dwg AutoCAD Color Index sheet
+    // regression where the narrow side viewports leaked transformed
+    // model points outside their rects, biasing the bbox left).
+    // Using the rect union for clipped regions keeps the bbox tight
+    // and symmetric around the actual visible paper area.
     bool has_sheet_clip = false;
     for (auto const& m : e.clip_markers) {
         if (m.kind != ClipMarker::Kind::Push) continue;
@@ -57,17 +84,52 @@ inline BBox compute_bbox(Entities const& e) {
         has_sheet_clip = true;
     }
     if (has_sheet_clip) {
-        // Also fold in any sheet-owned entities that may sit just
-        // outside the viewport rect union (title text, frame), so a
-        // title block above the rect cluster doesn't get cropped.
-        for (auto const& t : e.texts) {
+        for_each_outside_clip(e.texts, e.clip_markers,
+                              &ClipMarker::texts_idx,
+                              [&](Text const& t, std::size_t) {
             b.add(t.position.x, t.position.y);
             b.add(t.position.x, t.position.y + t.height);
-        }
-        for (auto const& l : e.lines) {
+        });
+        for_each_outside_clip(e.lines, e.clip_markers,
+                              &ClipMarker::lines_idx,
+                              [&](Line const& l, std::size_t) {
             b.add(l.a.x, l.a.y);
             b.add(l.b.x, l.b.y);
-        }
+        });
+        for_each_outside_clip(e.arcs, e.clip_markers,
+                              &ClipMarker::arcs_idx,
+                              [&](Arc const& a, std::size_t) {
+            b.add(a.center.x - a.radius, a.center.y - a.radius);
+            b.add(a.center.x + a.radius, a.center.y + a.radius);
+        });
+        for_each_outside_clip(e.bulged_polylines, e.clip_markers,
+                              &ClipMarker::bulged_idx,
+                              [&](BulgedPolyline const& bp, std::size_t) {
+            for (auto const& v : bp.vertices) b.add(v.x, v.y);
+        });
+        for_each_outside_clip(e.ellipses, e.clip_markers,
+                              &ClipMarker::ellipses_idx,
+                              [&](Ellipse const& el, std::size_t) {
+            double const ux = el.major_axis.x;
+            double const uy = el.major_axis.y;
+            double const k2 = el.minor_ratio * el.minor_ratio;
+            double const half_w = std::sqrt(ux * ux + uy * uy * k2);
+            double const half_h = std::sqrt(uy * uy + ux * ux * k2);
+            b.add(el.center.x - half_w, el.center.y - half_h);
+            b.add(el.center.x + half_w, el.center.y + half_h);
+        });
+        for_each_outside_clip(e.splines, e.clip_markers,
+                              &ClipMarker::splines_idx,
+                              [&](Spline const& sp, std::size_t) {
+            for (auto const& p : sp.points) b.add(p.x, p.y);
+        });
+        for_each_outside_clip(e.hatches, e.clip_markers,
+                              &ClipMarker::hatches_idx,
+                              [&](Hatch const& h, std::size_t) {
+            for (auto const& loop : h.loops) {
+                for (auto const& p : loop) b.add(p.x, p.y);
+            }
+        });
         return b;
     }
 
