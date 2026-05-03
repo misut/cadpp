@@ -985,6 +985,52 @@ void expand_viewport(Dwg_Data* dwg,
         return (dx * dx + dy * dy) <= clip_r2;
     };
 
+    // Model-space view-rect AABB cull. Each paper-space VIEWPORT only
+    // needs entities whose model coordinates land inside the
+    // [VCx ± halfW, VCy ± halfH] box that gets transformed onto its
+    // paper rect — anything outside renders to paper coordinates the
+    // renderer's scissor clips immediately, so the parser's transform
+    // + push-into-vector work was wasted. colorwh.dwg's AutoCAD Color
+    // Index sheet exposes this: two narrow side viewports look at
+    // model x≈[301..346] and x≈[745..790], but the file's 36k SOLIDs
+    // live around x∈[-148..147] (True Color wheel) and x∈[384..680]
+    // (Color Index wheel). Without this cull each side viewport
+    // walked, transformed, and emitted the entire 36k SOLID list,
+    // tripling per-frame parse work and producing the user-visible
+    // lag on the Color Index sheet.
+    //
+    // twist=0 viewports get an exact axis-aligned model rect. Rotated
+    // viewports skip the rect cull entirely so the rotated view's
+    // edges don't accidentally cull entities inside the visible
+    // diamond — a future pass can compute the AABB of the rotated
+    // rect for those.
+    bool   has_view_rect = false;
+    double view_xlo = 0.0, view_xhi = 0.0, view_ylo = 0.0, view_yhi = 0.0;
+    if (std::fabs(vp->twist_angle) < 1e-6
+        && vp->VIEWSIZE > 0.0 && vp->height > 0.0 && vp->width > 0.0) {
+        double const half_h = vp->VIEWSIZE * 0.5;
+        double const half_w = half_h * (vp->width / vp->height);
+        // 2% padding so entities whose ref point sits just outside the
+        // rect but whose extent crosses into the visible area aren't
+        // dropped. Cheaper than a per-entity bbox computation; the
+        // visible-edge entities are typically a tiny minority.
+        double const pad_x = half_w * 0.02;
+        double const pad_y = half_h * 0.02;
+        view_xlo = vp->VIEWCTR.x - half_w - pad_x;
+        view_xhi = vp->VIEWCTR.x + half_w + pad_x;
+        view_ylo = vp->VIEWCTR.y - half_h - pad_y;
+        view_yhi = vp->VIEWCTR.y + half_h + pad_y;
+        has_view_rect = true;
+    }
+
+    auto inside_view_rect = [&](Dwg_Object const* eobj) -> bool {
+        if (!has_view_rect) return true;
+        double mx = 0.0, my = 0.0;
+        if (!entity_ref_pt(eobj, mx, my)) return true;
+        return mx >= view_xlo && mx <= view_xhi
+            && my >= view_ylo && my <= view_yhi;
+    };
+
     if (model_bh->entities != nullptr) {
         for (BITCODE_BL i = 0; i < model_bh->num_owned; ++i) {
             BITCODE_H href = model_bh->entities[i];
@@ -992,6 +1038,10 @@ void expand_viewport(Dwg_Data* dwg,
             Dwg_Object* child = dwg_ref_object(dwg, href);
             if (child == nullptr) continue;
             if (child->supertype != DWG_SUPERTYPE_ENTITY) continue;
+            // Coarse model-space AABB cull first (cheapest test, kicks
+            // out the bulk of unrelated entities). Circle cull then
+            // sharpens to round viewport boundaries.
+            if (!inside_view_rect(child)) continue;
             // Filter per-viewport frozen layers. Each paper-space
             // VIEWPORT freezes specific layers (its `frozen_layers`
             // handle list) on top of the global frozen flag —
