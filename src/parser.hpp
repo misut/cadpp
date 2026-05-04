@@ -229,6 +229,29 @@ struct Hatch {
     bool                            solid = true;
 };
 
+// SOLID / TRACE store a single filled quadrilateral. Keep them out of
+// HATCH so the renderer can batch thousands of true-colour cells into
+// phenotype::Painter::fill_quads instead of sending one FillPath per
+// rectangle.
+struct SolidQuad {
+    Point p0;
+    Point p1;
+    Point p2;
+    Point p3;
+    Color color{};
+    std::string layer_name;
+};
+
+enum class FillKind : std::uint8_t {
+    SolidQuad,
+    Hatch,
+};
+
+struct FillItem {
+    FillKind kind = FillKind::SolidQuad;
+    std::size_t index = 0;
+};
+
 // Slab 4 — DWG LAYER table entry. Drawing entities reference layers
 // either explicitly (the entity's `layer_name`) or implicitly (BYLAYER
 // colour fall-through). Frozen / off layers are normally hidden by the
@@ -323,6 +346,8 @@ struct ClipMarker {
     std::size_t bulged_idx   = 0;
     std::size_t ellipses_idx = 0;
     std::size_t splines_idx  = 0;
+    std::size_t fills_idx    = 0;
+    std::size_t solid_quads_idx = 0;
     std::size_t hatches_idx  = 0;
     std::size_t texts_idx    = 0;
 };
@@ -337,7 +362,9 @@ struct Entities {
     std::vector<BulgedPolyline> bulged_polylines;  // LWPOLYLINE with any non-zero bulge
     std::vector<Ellipse> ellipses;                 // AutoCAD ELLIPSE entities
     std::vector<Spline>  splines;                  // AutoCAD SPLINE entities (Slab 5)
+    std::vector<SolidQuad> solid_quads;            // SOLID / TRACE fast fill quads
     std::vector<Hatch>   hatches;                  // AutoCAD HATCH entities (Slab 5)
+    std::vector<FillItem> fills;                   // HATCH + SOLID/TRACE parse order
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
     std::vector<Linetype> linetypes;               // DWG LTYPE table (Slab 7)
     std::vector<Style>   styles;                   // DWG STYLE table (Slab 8 — fonts)
@@ -358,6 +385,7 @@ struct Entities {
     unsigned int insert_count = 0;     // Slab 5 — INSERT block instances expanded
     unsigned int minsert_count = 0;    // Slab 5 — MINSERT (rectangular array INSERT) entities
     unsigned int dimension_count = 0;  // Slab 5 — DIMENSION pre-rendered blocks expanded
+    unsigned int solid_quad_count = 0; // SOLID / TRACE quadrilaterals captured
     unsigned int hatch_count = 0;      // Slab 5 — HATCH boundary loops captured
     unsigned int linetype_count = 0;   // Slab 7 — LTYPE table entries captured
     unsigned int style_count = 0;      // Slab 8 — STYLE table entries captured

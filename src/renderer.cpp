@@ -113,6 +113,153 @@ inline void process_clip_markers(
     }
 }
 
+inline void render_hatch_item(phenotype::Painter& p,
+                              Hatch const& h,
+                              ViewportTransform const& transform) {
+    for (auto const& loop : h.loops) {
+        if (loop.size() < 3) continue;
+        phenotype::PathBuilder pb;
+        auto const start = transform.apply(loop[0].x, loop[0].y);
+        pb.move_to(static_cast<float>(start.x),
+                   static_cast<float>(start.y));
+        for (std::size_t i = 1; i < loop.size(); ++i) {
+            auto const c = transform.apply(loop[i].x, loop[i].y);
+            pb.line_to(static_cast<float>(c.x),
+                       static_cast<float>(c.y));
+        }
+        p.fill_path(pb, to_paint(h.color));
+    }
+}
+
+inline bool solid_quad_is_convex(SolidQuad const& q) {
+    constexpr double kConvexEpsilon = 1e-12;
+    Point const pts[4] = {q.p0, q.p1, q.p2, q.p3};
+    bool has_pos = false;
+    bool has_neg = false;
+    for (int i = 0; i < 4; ++i) {
+        auto const& a = pts[i];
+        auto const& b = pts[(i + 1) % 4];
+        auto const& c = pts[(i + 2) % 4];
+        double const abx = b.x - a.x;
+        double const aby = b.y - a.y;
+        double const bcx = c.x - b.x;
+        double const bcy = c.y - b.y;
+        double const cross = abx * bcy - aby * bcx;
+        if (cross > kConvexEpsilon) has_pos = true;
+        if (cross < -kConvexEpsilon) has_neg = true;
+        if (has_pos && has_neg) return false;
+    }
+    return has_pos || has_neg;
+}
+
+inline void render_solid_quad_path(phenotype::Painter& p,
+                                   SolidQuad const& q,
+                                   ViewportTransform const& transform) {
+    auto const p0 = transform.apply(q.p0.x, q.p0.y);
+    auto const p1 = transform.apply(q.p1.x, q.p1.y);
+    auto const p2 = transform.apply(q.p2.x, q.p2.y);
+    auto const p3 = transform.apply(q.p3.x, q.p3.y);
+    phenotype::PathBuilder pb;
+    pb.move_to(static_cast<float>(p0.x), static_cast<float>(p0.y));
+    pb.line_to(static_cast<float>(p1.x), static_cast<float>(p1.y));
+    pb.line_to(static_cast<float>(p2.x), static_cast<float>(p2.y));
+    pb.line_to(static_cast<float>(p3.x), static_cast<float>(p3.y));
+    p.fill_path(pb, to_paint(q.color));
+}
+
+class SolidFillBatcher {
+public:
+    SolidFillBatcher(phenotype::Painter& painter,
+                     ViewportTransform const& viewport_transform)
+        : p(painter), transform(viewport_transform) {
+        rect_batch.reserve(kBatchSize);
+        quad_batch.reserve(kBatchSize);
+    }
+
+    void add(SolidQuad const& q) {
+        auto const color = to_paint(q.color);
+        bool const axis_aligned =
+            near(q.p0.y, q.p1.y) && near(q.p2.y, q.p3.y)
+            && near(q.p0.x, q.p3.x) && near(q.p1.x, q.p2.x);
+        if (axis_aligned) {
+            double const min_wx = std::min(q.p0.x, q.p1.x);
+            double const max_wx = std::max(q.p0.x, q.p1.x);
+            double const min_wy = std::min(q.p0.y, q.p3.y);
+            double const max_wy = std::max(q.p0.y, q.p3.y);
+            auto const ca = transform.apply(min_wx, max_wy);
+            auto const cb = transform.apply(max_wx, min_wy);
+            double const min_x = std::min(ca.x, cb.x);
+            double const max_x = std::max(ca.x, cb.x);
+            double const min_y = std::min(ca.y, cb.y);
+            double const max_y = std::max(ca.y, cb.y);
+            select_kind(BatchKind::Rect);
+            rect_batch.push_back(phenotype::PaintRect{
+                static_cast<float>(min_x),
+                static_cast<float>(min_y),
+                static_cast<float>(max_x - min_x),
+                static_cast<float>(max_y - min_y),
+                color,
+            });
+            if (rect_batch.size() == kBatchSize) flush();
+            return;
+        }
+
+        if (!solid_quad_is_convex(q)) {
+            flush();
+            render_solid_quad_path(p, q, transform);
+            return;
+        }
+
+        auto const p0 = transform.apply(q.p0.x, q.p0.y);
+        auto const p1 = transform.apply(q.p1.x, q.p1.y);
+        auto const p2 = transform.apply(q.p2.x, q.p2.y);
+        auto const p3 = transform.apply(q.p3.x, q.p3.y);
+        select_kind(BatchKind::Quad);
+        quad_batch.push_back(phenotype::PaintQuad{
+            static_cast<float>(p0.x), static_cast<float>(p0.y),
+            static_cast<float>(p1.x), static_cast<float>(p1.y),
+            static_cast<float>(p2.x), static_cast<float>(p2.y),
+            static_cast<float>(p3.x), static_cast<float>(p3.y),
+            color,
+        });
+        if (quad_batch.size() == kBatchSize) flush();
+    }
+
+    void flush() {
+        if (!rect_batch.empty()) {
+            p.fill_rects(rect_batch.data(),
+                         static_cast<unsigned int>(rect_batch.size()));
+            rect_batch.clear();
+        }
+        if (!quad_batch.empty()) {
+            p.fill_quads(quad_batch.data(),
+                         static_cast<unsigned int>(quad_batch.size()));
+            quad_batch.clear();
+        }
+        active_kind = BatchKind::None;
+    }
+
+private:
+    enum class BatchKind { None, Rect, Quad };
+    static constexpr std::size_t kBatchSize = 8192;
+    static constexpr double kAxisEpsilon = 1e-9;
+
+    static bool near(double a, double b) {
+        return std::abs(a - b) <= kAxisEpsilon;
+    }
+
+    void select_kind(BatchKind kind) {
+        if (active_kind != BatchKind::None && active_kind != kind) flush();
+        active_kind = kind;
+    }
+
+    phenotype::Painter& p;
+    ViewportTransform const& transform;
+    std::vector<phenotype::PaintRect> rect_batch;
+    std::vector<phenotype::PaintQuad> quad_batch;
+    BatchKind active_kind = BatchKind::None;
+};
+
 } // namespace
 
 void render_lines(phenotype::Painter& p,
@@ -695,23 +842,152 @@ void render_hatches(phenotype::Painter& p,
                              &ClipMarker::hatches_idx, hi, transform);
         auto const& h = entities.hatches[hi];
         if (!is_visible(visibility, h.layer_name)) continue;
-        for (auto const& loop : h.loops) {
-            if (loop.size() < 3) continue;
-            phenotype::PathBuilder pb;
-            auto const start = transform.apply(loop[0].x, loop[0].y);
-            pb.move_to(static_cast<float>(start.x),
-                       static_cast<float>(start.y));
-            for (std::size_t i = 1; i < loop.size(); ++i) {
-                auto const c = transform.apply(loop[i].x, loop[i].y);
-                pb.line_to(static_cast<float>(c.x),
-                           static_cast<float>(c.y));
-            }
-            p.fill_path(pb, to_paint(h.color));
-        }
+        render_hatch_item(p, h, transform);
     }
     process_clip_markers(p, entities.clip_markers, cursor,
                          &ClipMarker::hatches_idx,
                          entities.hatches.size(), transform);
+}
+
+void render_solid_quads(phenotype::Painter& p,
+                        Entities const& entities,
+                        ViewportTransform const& transform,
+                        LayerVisibility const& visibility) {
+    constexpr std::size_t kBatchSize = 8192;
+    constexpr double kAxisEpsilon = 1e-9;
+    std::vector<phenotype::PaintRect> rect_batch;
+    std::vector<phenotype::PaintQuad> quad_batch;
+    rect_batch.reserve(kBatchSize);
+    quad_batch.reserve(kBatchSize);
+    enum class BatchKind { None, Rect, Quad };
+    BatchKind active_kind = BatchKind::None;
+
+    auto flush = [&]() {
+        if (!rect_batch.empty()) {
+            p.fill_rects(rect_batch.data(),
+                         static_cast<unsigned int>(rect_batch.size()));
+            rect_batch.clear();
+        }
+        if (!quad_batch.empty()) {
+            p.fill_quads(quad_batch.data(),
+                         static_cast<unsigned int>(quad_batch.size()));
+            quad_batch.clear();
+        }
+        active_kind = BatchKind::None;
+    };
+    auto select_kind = [&](BatchKind kind) {
+        if (active_kind != BatchKind::None && active_kind != kind) flush();
+        active_kind = kind;
+    };
+    auto near = [&](double a, double b) {
+        return std::abs(a - b) <= kAxisEpsilon;
+    };
+
+    std::size_t cursor = 0;
+    for (std::size_t qi = 0; qi < entities.solid_quads.size(); ++qi) {
+        if (cursor < entities.clip_markers.size()
+            && entities.clip_markers[cursor].solid_quads_idx == qi) {
+            flush();
+            process_clip_markers(p, entities.clip_markers, cursor,
+                                 &ClipMarker::solid_quads_idx, qi, transform);
+        }
+        auto const& q = entities.solid_quads[qi];
+        if (!is_visible(visibility, q.layer_name)) continue;
+
+        auto const color = to_paint(q.color);
+        bool const axis_aligned =
+            near(q.p0.y, q.p1.y) && near(q.p2.y, q.p3.y)
+            && near(q.p0.x, q.p3.x) && near(q.p1.x, q.p2.x);
+        if (axis_aligned) {
+            double const min_wx = std::min(q.p0.x, q.p1.x);
+            double const max_wx = std::max(q.p0.x, q.p1.x);
+            double const min_wy = std::min(q.p0.y, q.p3.y);
+            double const max_wy = std::max(q.p0.y, q.p3.y);
+            auto const ca = transform.apply(min_wx, max_wy);
+            auto const cb = transform.apply(max_wx, min_wy);
+            double const min_x = std::min(ca.x, cb.x);
+            double const max_x = std::max(ca.x, cb.x);
+            double const min_y = std::min(ca.y, cb.y);
+            double const max_y = std::max(ca.y, cb.y);
+            select_kind(BatchKind::Rect);
+            rect_batch.push_back(phenotype::PaintRect{
+                static_cast<float>(min_x),
+                static_cast<float>(min_y),
+                static_cast<float>(max_x - min_x),
+                static_cast<float>(max_y - min_y),
+                color,
+            });
+            if (rect_batch.size() == kBatchSize) flush();
+            continue;
+        }
+
+        if (!solid_quad_is_convex(q)) {
+            flush();
+            render_solid_quad_path(p, q, transform);
+            continue;
+        }
+
+        auto const p0 = transform.apply(q.p0.x, q.p0.y);
+        auto const p1 = transform.apply(q.p1.x, q.p1.y);
+        auto const p2 = transform.apply(q.p2.x, q.p2.y);
+        auto const p3 = transform.apply(q.p3.x, q.p3.y);
+        select_kind(BatchKind::Quad);
+        quad_batch.push_back(phenotype::PaintQuad{
+            static_cast<float>(p0.x), static_cast<float>(p0.y),
+            static_cast<float>(p1.x), static_cast<float>(p1.y),
+            static_cast<float>(p2.x), static_cast<float>(p2.y),
+            static_cast<float>(p3.x), static_cast<float>(p3.y),
+            color,
+        });
+        if (quad_batch.size() == kBatchSize) flush();
+    }
+    flush();
+    process_clip_markers(p, entities.clip_markers, cursor,
+                         &ClipMarker::solid_quads_idx,
+                         entities.solid_quads.size(), transform);
+}
+
+void render_fills(phenotype::Painter& p,
+                  Entities const& entities,
+                  ViewportTransform const& transform,
+                  LayerVisibility const& visibility) {
+    if (entities.hatches.empty()) {
+        render_solid_quads(p, entities, transform, visibility);
+        return;
+    }
+    if (entities.solid_quads.empty()) {
+        render_hatches(p, entities, transform, visibility);
+        return;
+    }
+
+    SolidFillBatcher batcher(p, transform);
+    std::size_t cursor = 0;
+    for (std::size_t i = 0; i < entities.fills.size(); ++i) {
+        if (cursor < entities.clip_markers.size()
+            && entities.clip_markers[cursor].fills_idx == i) {
+            batcher.flush();
+            process_clip_markers(p, entities.clip_markers, cursor,
+                                 &ClipMarker::fills_idx, i, transform);
+        }
+
+        auto const& item = entities.fills[i];
+        if (item.kind == FillKind::SolidQuad) {
+            if (item.index >= entities.solid_quads.size()) continue;
+            auto const& q = entities.solid_quads[item.index];
+            if (!is_visible(visibility, q.layer_name)) continue;
+            batcher.add(q);
+        } else {
+            if (item.index >= entities.hatches.size()) continue;
+            auto const& h = entities.hatches[item.index];
+            if (!is_visible(visibility, h.layer_name)) continue;
+            batcher.flush();
+            render_hatch_item(p, h, transform);
+        }
+    }
+    batcher.flush();
+    process_clip_markers(p, entities.clip_markers, cursor,
+                         &ClipMarker::fills_idx,
+                         entities.fills.size(), transform);
 }
 
 } // namespace cadpp

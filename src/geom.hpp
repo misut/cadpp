@@ -123,6 +123,14 @@ inline BBox compute_bbox(Entities const& e) {
                               [&](Spline const& sp, std::size_t) {
             for (auto const& p : sp.points) b.add(p.x, p.y);
         });
+        for_each_outside_clip(e.solid_quads, e.clip_markers,
+                              &ClipMarker::solid_quads_idx,
+                              [&](SolidQuad const& q, std::size_t) {
+            b.add(q.p0.x, q.p0.y);
+            b.add(q.p1.x, q.p1.y);
+            b.add(q.p2.x, q.p2.y);
+            b.add(q.p3.x, q.p3.y);
+        });
         for_each_outside_clip(e.hatches, e.clip_markers,
                               &ClipMarker::hatches_idx,
                               [&](Hatch const& h, std::size_t) {
@@ -171,6 +179,12 @@ inline BBox compute_bbox(Entities const& e) {
     // via the `closed` flag, no extra add needed.
     for (auto const& sp : e.splines) {
         for (auto const& p : sp.points) b.add(p.x, p.y);
+    }
+    for (auto const& q : e.solid_quads) {
+        b.add(q.p0.x, q.p0.y);
+        b.add(q.p1.x, q.p1.y);
+        b.add(q.p2.x, q.p2.y);
+        b.add(q.p3.x, q.p3.y);
     }
     // Bulged polylines: vertex bbox only. A `bulge != 0` arc segment
     // can swing outside the chord-vertex rectangle, but accounting

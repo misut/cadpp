@@ -1067,7 +1067,8 @@ void emit_clip_marker(Entities& out, ClipMarker::Kind kind,
         kind, x, y, w, h,
         out.lines.size(), out.arcs.size(),
         out.bulged_polylines.size(), out.ellipses.size(),
-        out.splines.size(), out.hatches.size(), out.texts.size(),
+        out.splines.size(), out.fills.size(), out.solid_quads.size(),
+        out.hatches.size(), out.texts.size(),
     });
 }
 
@@ -1849,19 +1850,17 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const& c3 = sol ? sol->corner3 : tra->corner3;
             auto const& c4 = sol ? sol->corner4 : tra->corner4;
             auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
-            Hatch hatch{};
-            hatch.color      = meta.color;
-            hatch.layer_name = std::move(meta.layer_name);
-            hatch.solid      = true;
-            std::vector<Point> loop;
-            loop.reserve(4);
-            loop.push_back(xf.apply_point(c1.x, c1.y));
-            loop.push_back(xf.apply_point(c2.x, c2.y));
-            loop.push_back(xf.apply_point(c4.x, c4.y));
-            loop.push_back(xf.apply_point(c3.x, c3.y));
-            hatch.loops.push_back(std::move(loop));
-            out.hatches.push_back(std::move(hatch));
-            ++out.hatch_count;
+            SolidQuad quad{};
+            quad.color      = meta.color;
+            quad.layer_name = std::move(meta.layer_name);
+            quad.p0 = xf.apply_point(c1.x, c1.y);
+            quad.p1 = xf.apply_point(c2.x, c2.y);
+            quad.p2 = xf.apply_point(c4.x, c4.y);
+            quad.p3 = xf.apply_point(c3.x, c3.y);
+            auto const idx = out.solid_quads.size();
+            out.solid_quads.push_back(std::move(quad));
+            out.fills.push_back({FillKind::SolidQuad, idx});
+            ++out.solid_quad_count;
             break;
         }
         case DWG_TYPE_HATCH: {
@@ -2003,7 +2002,9 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             }
 
             if (!hatch.loops.empty()) {
+                auto const idx = out.hatches.size();
                 out.hatches.push_back(std::move(hatch));
+                out.fills.push_back({FillKind::Hatch, idx});
                 ++out.hatch_count;
             } else {
                 ++out.unknown_entities;
