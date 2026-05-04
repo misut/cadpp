@@ -4,6 +4,7 @@
 // Copyright (C) 2026 misut
 
 #include "app.hpp"
+#include "fonts.hpp"
 
 import std;
 import phenotype;
@@ -89,6 +90,14 @@ void State::load(std::string path, std::string layout) {
     source_path = std::move(path);
     selected_layout = std::move(layout);
     entities = parse_file(source_path, selected_layout);
+    // Try to register each STYLE's font file with phenotype before the
+    // first paint — when the file is found, FontSpec lookups for that
+    // family resolve to the real AutoCAD face instead of the alias-
+    // table substitute. Silently no-ops on misses; the alias table
+    // covers the common SHX / Bitstream families either way.
+    if (entities.ok) {
+        register_style_fonts(entities.styles);
+    }
     // Snap `selected_layout` to whatever `parse_file` actually picked
     // so the picker's "active" highlight stays accurate when an empty
     // / stale filter falls through to the first layout in tab order.
