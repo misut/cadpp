@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import std;
+import phenotype;
+import phenotype.native;
 
 #include "fonts.hpp"
+#include "parser.hpp"
 
 namespace cadpp {
 
@@ -108,6 +111,134 @@ std::string_view alias_font_family(std::string_view dwg_family) noexcept {
         if (canon_contains(key, from)) return to;
     }
     return {};
+}
+
+namespace {
+
+// Push standard macOS font search directories onto `out`. Order
+// matters — the env-var override comes first so users can shadow
+// system fonts with their own copy of an AutoCAD face.
+void collect_search_dirs(std::vector<std::string>& out) {
+    if (char const* env = std::getenv("CADPP_FONT_DIR"); env != nullptr) {
+        std::string_view rest{env};
+        while (!rest.empty()) {
+            auto const sep = rest.find(':');
+            auto piece = (sep == std::string_view::npos) ? rest : rest.substr(0, sep);
+            if (!piece.empty()) out.emplace_back(piece);
+            if (sep == std::string_view::npos) break;
+            rest = rest.substr(sep + 1);
+        }
+    }
+    if (char const* home = std::getenv("HOME"); home != nullptr) {
+        out.emplace_back(std::string{home} + "/Library/Fonts");
+        out.emplace_back(std::string{home}
+            + "/Library/Application Support/Autodesk/Web Services/"
+              "Login State/SOMServices/com.autodesk.shared/Fonts");
+    }
+    out.emplace_back("/Library/Fonts");
+    out.emplace_back("/System/Library/Fonts");
+}
+
+bool ends_with_ci(std::string_view s, std::string_view suffix) {
+    if (suffix.size() > s.size()) return false;
+    auto const off = s.size() - suffix.size();
+    for (std::size_t i = 0; i < suffix.size(); ++i) {
+        char a = s[off + i], b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+        if (a != b) return false;
+    }
+    return true;
+}
+
+bool ieq(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+// Given a STYLE `font_file` (e.g. "swisski.ttf" or "txt"), return the
+// candidate filenames to look for in the search dirs. Always includes
+// the original; for extensionless names (typical of SHX-style entries
+// that the parser kept as-is) appends `.ttf`, `.otf`, `.ttc` variants.
+std::vector<std::string> candidate_basenames(std::string const& font_file) {
+    std::vector<std::string> out;
+    if (font_file.empty()) return out;
+    auto const slash = font_file.find_last_of("/\\");
+    std::string base = (slash == std::string::npos)
+        ? font_file : font_file.substr(slash + 1);
+    out.push_back(base);
+    bool const has_ext = ends_with_ci(base, ".ttf")
+                      || ends_with_ci(base, ".otf")
+                      || ends_with_ci(base, ".ttc")
+                      || ends_with_ci(base, ".shx");
+    if (!has_ext) {
+        out.push_back(base + ".ttf");
+        out.push_back(base + ".otf");
+        out.push_back(base + ".ttc");
+    }
+    return out;
+}
+
+// Find the first match for any of `basenames` in any of `dirs` and
+// return its absolute path. Empty when nothing matched. Skips entries
+// whose names are not `.ttf` / `.otf` / `.ttc` (we can't register
+// `.shx` shape files with CoreText anyway).
+std::string find_font_file(std::vector<std::string> const& dirs,
+                           std::vector<std::string> const& basenames) {
+    namespace fs = std::filesystem;
+    for (auto const& dir : dirs) {
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) continue;
+        for (auto const& base : basenames) {
+            // Direct hit at the basename (case-sensitive on APFS,
+            // honoured by the underlying FS — no need to enumerate).
+            fs::path const p = fs::path{dir} / base;
+            if (fs::is_regular_file(p, ec)) return p.string();
+        }
+        // Fall back to a one-pass case-insensitive scan of the dir for
+        // each basename. Cheap (~hundreds of entries on Library/Fonts)
+        // and avoids missing the file when the on-disk name differs in
+        // case from the DWG's `font_file`.
+        for (auto const& entry : fs::directory_iterator{dir, ec}) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            auto const name = entry.path().filename().string();
+            for (auto const& base : basenames) {
+                if (ieq(name, base)) return entry.path().string();
+            }
+        }
+    }
+    return {};
+}
+
+} // namespace
+
+unsigned int register_style_fonts(std::span<Style const> styles) {
+    std::vector<std::string> dirs;
+    collect_search_dirs(dirs);
+    unsigned int registered = 0;
+    std::set<std::string> already; // dedupe by font_family
+    for (auto const& s : styles) {
+        if (s.font_family.empty() || s.font_file.empty()) continue;
+        if (!already.insert(s.font_family).second) continue;
+        auto const candidates = candidate_basenames(s.font_file);
+        auto const path = find_font_file(dirs, candidates);
+        if (path.empty()) continue;
+        // Skip SHX — CTFontManagerRegisterFontsForURL doesn't accept
+        // shape-only files; the alias-table substitute kicks in for
+        // those at render time.
+        if (ends_with_ci(path, ".shx")) continue;
+        if (phenotype::native::text::register_font_file(s.font_family, path)) {
+            ++registered;
+        }
+    }
+    return registered;
 }
 
 } // namespace cadpp
