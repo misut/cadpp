@@ -205,8 +205,9 @@ std::string find_font_file(std::vector<std::string> const& dirs,
         // each basename. Cheap (~hundreds of entries on Library/Fonts)
         // and avoids missing the file when the on-disk name differs in
         // case from the DWG's `font_file`.
-        for (auto const& entry : fs::directory_iterator{dir, ec}) {
-            if (ec) break;
+        fs::directory_iterator it{dir, ec};
+        for (; !ec && !(it == std::default_sentinel); it.increment(ec)) {
+            auto const& entry = *it;
             if (!entry.is_regular_file()) continue;
             auto const name = entry.path().filename().string();
             for (auto const& base : basenames) {

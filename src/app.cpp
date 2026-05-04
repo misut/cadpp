@@ -14,6 +14,7 @@ import phenotype.state;
 namespace cadpp {
 
 std::string g_dwg_path = "test/fixtures/sample_2000.dwg";
+std::string g_dwg_layout;
 
 namespace {
 
@@ -45,6 +46,23 @@ void apply_platform_theme() {
 void apply_platform_theme() {}
 #endif
 
+bool perf_enabled() {
+    static bool enabled = [] {
+        auto const* v = std::getenv("CADPP_PERF");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] == '1' || v[0] == 'y' || v[0] == 'Y'
+            || v[0] == 't' || v[0] == 'T';
+    }();
+    return enabled;
+}
+
+using PerfClock = std::chrono::steady_clock;
+
+double elapsed_ms(PerfClock::time_point a,
+                  PerfClock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
 } // namespace
 
 std::string format_summary(Entities const& e) {
@@ -65,6 +83,7 @@ std::string format_summary(Entities const& e) {
            + std::to_string(e.insert_count)    + " INSERT(s), "
            + std::to_string(e.minsert_count)   + " MINSERT(s), "
            + std::to_string(e.dimension_count) + " DIMENSION(s), "
+           + std::to_string(e.solid_quad_count) + " SOLID/TRACE(s), "
            + std::to_string(e.hatch_count)     + " HATCH(s)\n";
     out += "Linetypes: " + std::to_string(e.linetype_count) + "\n";
     out += "Tessellated segments: " + std::to_string(e.lines.size()) + "\n";
@@ -89,7 +108,9 @@ void apply_lineweight_policy(Entities& e, bool is_model) {
 void State::load(std::string path, std::string layout) {
     source_path = std::move(path);
     selected_layout = std::move(layout);
+    auto const parse_start = PerfClock::now();
     entities = parse_file(source_path, selected_layout);
+    auto const parse_end = PerfClock::now();
     // Try to register each STYLE's font file with phenotype before the
     // first paint — when the file is found, FontSpec lookups for that
     // family resolve to the real AutoCAD face instead of the alias-
@@ -121,16 +142,36 @@ void State::load(std::string path, std::string layout) {
         layer_visible[layer.name] = !(layer.frozen || layer.off);
     }
     if (entities.ok) {
+        auto const bbox_start = PerfClock::now();
+        auto bbox = compute_bbox(entities);
+        auto const bbox_end = PerfClock::now();
         transform = ViewportTransform::fit(
-            compute_bbox(entities), kCanvasWidth, kCanvasHeight);
+            bbox, kCanvasWidth, kCanvasHeight);
+        if (perf_enabled()) {
+            std::cerr
+                << "[cadpp.perf] load layout=\"" << selected_layout
+                << "\" solids=" << entities.solid_quads.size()
+                << " hatches=" << entities.hatches.size()
+                << " lines=" << entities.lines.size()
+                << " texts=" << entities.texts.size()
+                << " parse_ms=" << elapsed_ms(parse_start, parse_end)
+                << " bbox_ms=" << elapsed_ms(bbox_start, bbox_end)
+                << "\n";
+        }
     } else {
         transform = ViewportTransform{};
+        if (perf_enabled()) {
+            std::cerr
+                << "[cadpp.perf] load failed parse_ms="
+                << elapsed_ms(parse_start, parse_end)
+                << " error=\"" << entities.error << "\"\n";
+        }
     }
 }
 
 State::State() {
     apply_platform_theme();
-    load(g_dwg_path);
+    load(g_dwg_path, g_dwg_layout);
 }
 
 namespace {
@@ -350,6 +391,8 @@ std::uint64_t hash_canvas_inputs(State const& state) noexcept {
     vec_print(state.entities.bulged_polylines);
     vec_print(state.entities.ellipses);
     vec_print(state.entities.splines);
+    vec_print(state.entities.fills);
+    vec_print(state.entities.solid_quads);
     vec_print(state.entities.hatches);
     vec_print(state.entities.texts);
     h = mix(h, state.entities.ok ? 1ULL : 0ULL);
@@ -377,6 +420,7 @@ std::uint64_t hash_canvas_inputs(State const& state) noexcept {
 
 auto canvas_painter(State const& state) {
     return [&state](phenotype::Painter& p) {
+        auto const paint_start = PerfClock::now();
         constexpr float kBorder = 2.0f;
         constexpr phenotype::Color kBorderColor{107, 114, 128, 255};
         float inset = kBorder * 0.5f;
@@ -387,10 +431,12 @@ auto canvas_painter(State const& state) {
         p.line(w,     h,     inset, h,     kBorder, kBorderColor);
         p.line(inset, h,     inset, inset, kBorder, kBorderColor);
 
-        // Hatches render first so subsequent strokes / arcs / text
+        // Fills render first so subsequent strokes / arcs / text
         // overlay correctly. CAD convention.
-        render_hatches(p, state.entities, state.transform,
-                       state.layer_visible);
+        auto const fills_start = PerfClock::now();
+        render_fills(p, state.entities, state.transform,
+                     state.layer_visible);
+        auto const fills_end = PerfClock::now();
         render_lines(p, state.entities, state.transform,
                      state.layer_visible);
         render_arcs(p, state.entities, state.transform,
@@ -399,6 +445,17 @@ auto canvas_painter(State const& state) {
                      state.layer_visible);
         render_texts(p, state.entities, state.transform,
                      state.layer_visible);
+        auto const paint_end = PerfClock::now();
+        if (perf_enabled()) {
+            std::cerr
+                << "[cadpp.perf] paint layout=\"" << state.selected_layout
+                << "\" solids=" << state.entities.solid_quads.size()
+                << " hatches=" << state.entities.hatches.size()
+                << " fill_ms=" << elapsed_ms(fills_start, fills_end)
+                << " total_ms=" << elapsed_ms(paint_start, paint_end)
+                << " scale=" << state.transform.scale
+                << "\n";
+        }
     };
 }
 } // namespace

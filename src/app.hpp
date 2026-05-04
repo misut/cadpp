@@ -23,6 +23,7 @@ namespace cadpp {
 // `State` is default-constructed by `phenotype::native::run_app`. The
 // constructor reads it on first call and treats it as the source DWG.
 extern std::string g_dwg_path;
+extern std::string g_dwg_layout;
 
 // Canvas size doubles on Android because phenotype's surface is
 // 1:1 with physical pixels — a 1080×2400 phone would only fill the
