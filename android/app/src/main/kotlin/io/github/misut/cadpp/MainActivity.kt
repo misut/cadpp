@@ -1,6 +1,7 @@
 package io.github.misut.cadpp
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -63,6 +64,49 @@ class MainActivity : GameActivity() {
     }
 
     private fun startFileDialog(cookie: Int, filterExtensions: String) {
+        val bundled = bundledDrawings()
+        if (bundled.isNotEmpty()) {
+            showBundledDrawingDialog(cookie, filterExtensions, bundled)
+            return
+        }
+        startSystemFileDialog(cookie, filterExtensions)
+    }
+
+    private fun showBundledDrawingDialog(
+        cookie: Int,
+        filterExtensions: String,
+        bundled: List<String>
+    ) {
+        val labels = bundled
+            .map { it.substringAfterLast('/') }
+            .plus("Browse device...")
+            .toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Open drawing")
+            .setItems(labels) { _, which ->
+                if (which < bundled.size) {
+                    val assetPath = bundled[which]
+                    val cachedPath = stageAssetToCache(assetPath)
+                    if (cachedPath == null) {
+                        Log.e(TAG, "failed to stage bundled sample $assetPath")
+                        onFileDialogResult(cookie, null)
+                    } else {
+                        Log.i(TAG, "bundled sample picked: $assetPath -> $cachedPath")
+                        onFileDialogResult(cookie, cachedPath)
+                    }
+                } else {
+                    startSystemFileDialog(cookie, filterExtensions)
+                }
+            }
+            .setOnCancelListener {
+                Log.i(TAG, "bundled sample dialog cancelled (cookie=$cookie)")
+                onFileDialogResult(cookie, null)
+            }
+            .show()
+    }
+
+    private fun startSystemFileDialog(cookie: Int, filterExtensions: String) {
         pendingCookie = cookie
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -134,6 +178,51 @@ class MainActivity : GameActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "stageContentToCache failed for $uri", e)
             null
+        }
+    }
+
+    private fun stageAssetToCache(assetPath: String): String? {
+        return try {
+            val safe = assetPath
+                .substringAfterLast('/')
+                .take(80)
+                .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                .ifBlank { "sample.dwg" }
+            val outFile = File(cacheDir, "asset-${System.currentTimeMillis()}-$safe")
+            assets.open(assetPath).use { input ->
+                outFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            outFile.absolutePath
+        } catch (e: Exception) {
+            Log.e(TAG, "stageAssetToCache failed for $assetPath", e)
+            null
+        }
+    }
+
+    private fun bundledDrawings(): List<String> {
+        val drawings = mutableListOf<String>()
+        val rootAssets = assets.list("").orEmpty()
+        if (rootAssets.any { it.equals("sample_2000.dwg", ignoreCase = true) }) {
+            drawings += "sample_2000.dwg"
+        }
+        drawings += listAssetDrawings("cadpp-samples")
+        return drawings
+            .distinct()
+            .sortedBy { it.substringAfterLast('/').lowercase() }
+    }
+
+    private fun listAssetDrawings(path: String): List<String> {
+        val children = assets.list(path).orEmpty()
+        if (children.isEmpty()) return emptyList()
+        return children.flatMap { child ->
+            val childPath = "$path/$child"
+            if (childPath.endsWith(".dwg", ignoreCase = true)) {
+                listOf(childPath)
+            } else {
+                listAssetDrawings(childPath)
+            }
         }
     }
 

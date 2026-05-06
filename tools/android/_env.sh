@@ -58,7 +58,8 @@ _cadpp_android_first_avd() {
 export ANDROID_HOME
 
 _ndk_default="$(_cadpp_android_default_ndk)"
-if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -n "$_ndk_default" ]; then
+if [ -n "$_ndk_default" ] \
+    && { [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "$ANDROID_NDK_HOME" ]; }; then
     ANDROID_NDK_HOME="$_ndk_default"
 fi
 [ -n "${ANDROID_NDK_HOME:-}" ] && export ANDROID_NDK_HOME
