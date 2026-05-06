@@ -1829,6 +1829,262 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             ++out.dimension_count;
             break;
         }
+        case DWG_TYPE_LEADER: {
+            // Pre-MULTILEADER LEADER entity. Carries an explicit
+            // polyline (`points[]`) plus an optional arrowhead flag
+            // and an `associated_annotation` handle pointing at the
+            // attached MTEXT / TOLERANCE / INSERT. Emit one `Line`
+            // per consecutive point pair under the entity's resolved
+            // colour / layer + ltype, one `ArrowHead` at `points[0]`
+            // when arrowhead_on (sized by `dimasz`), then dispatch
+            // the `associated_annotation` through the standard path.
+            auto const* ld = obj->tio.entity->tio.LEADER;
+            if (ld == nullptr || ld->points == nullptr
+                || ld->num_points < 2) {
+                ++out.unknown_entities; break;
+            }
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
+            float const thickness = 1.0f;
+            for (BITCODE_BL i = 0; i + 1 < ld->num_points; ++i) {
+                Point const a{ld->points[i].x,     ld->points[i].y};
+                Point const b{ld->points[i + 1].x, ld->points[i + 1].y};
+                if (dashes.empty()) {
+                    out.lines.push_back(Line{
+                        xf.apply_point(a.x, a.y),
+                        xf.apply_point(b.x, b.y),
+                        meta.color, meta.layer_name, thickness,
+                    });
+                    ++out.line_count;
+                } else {
+                    decompose_dashed_line(a, b, dashes, xf,
+                                          meta.color, meta.layer_name,
+                                          thickness, out);
+                }
+            }
+            if (ld->arrowhead_on) {
+                Point const tip{ld->points[0].x, ld->points[0].y};
+                Point const next{ld->points[1].x, ld->points[1].y};
+                double dx = next.x - tip.x;
+                double dy = next.y - tip.y;
+                double const len = std::sqrt(dx * dx + dy * dy);
+                if (len > 0.0) { dx /= len; dy /= len; }
+                Point const tip_w = xf.apply_point(tip.x, tip.y);
+                Point const dir_w = xf.apply_vector(dx, dy);
+                double const dlen = std::sqrt(
+                    dir_w.x * dir_w.x + dir_w.y * dir_w.y);
+                double const ux = dlen > 0 ? dir_w.x / dlen : 1.0;
+                double const uy = dlen > 0 ? dir_w.y / dlen : 0.0;
+                double const size =
+                    (ld->dimasz > 0.0 ? ld->dimasz : 0.18)
+                    * xf.scale_factor();
+                out.arrows.push_back(ArrowHead{
+                    tip_w, ux, uy, size, meta.color, meta.layer_name,
+                });
+            }
+            if (ld->associated_annotation != nullptr) {
+                Dwg_Object* assoc =
+                    dwg_ref_object(dwg, ld->associated_annotation);
+                if (assoc != nullptr
+                    && assoc->supertype == DWG_SUPERTYPE_ENTITY) {
+                    extract_entity_xf(dwg, assoc, xf, out);
+                }
+            }
+            ++out.leader_count;
+            break;
+        }
+        case DWG_TYPE_MULTILEADER: {
+            // MULTILEADER carries an `AnnotContext` (`ctx`) whose
+            // `leaders[]` list each contain a `lines[]` of polylines
+            // plus an optional dogleg landing segment. Emit every
+            // leader segment as a `Line`, drop one `ArrowHead` at the
+            // first point of each leader's first line, and emit the
+            // `ctx.content.txt` MTEXT (when present) as a `Text` so
+            // the existing renderer picks it up. The block-content
+            // variant (`has_content_blk`) expands a referenced block
+            // under the content's affine, mirroring INSERT.
+            auto const* ml = obj->tio.entity->tio.MULTILEADER;
+            if (ml == nullptr) { ++out.unknown_entities; break; }
+
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            // `line_color` overrides the entity colour for leader
+            // strokes (entity-level colour usually resolves BYLAYER).
+            Color leader_color = meta.color;
+            if (is_resolvable_cmc(ml->line_color)) {
+                leader_color = color_from_cmc(ml->line_color);
+            }
+            float const thickness = 1.0f;
+
+            // Resolve the arrow size in WORLD units. AutoCAD stores
+            // three related fields:
+            //   - `ml->arrow_size` (paper-space units, from MLEADER
+            //     entity's default — needs × ctx.scale_factor to
+            //     reach world units)
+            //   - `ml->ctx.arrow_size` (already pre-multiplied to
+            //     world units by the saved context — use verbatim)
+            //   - `0.18` (AutoCAD's universal paper default — needs
+            //     × ctx.scale_factor)
+            // Prefer the pre-resolved `ctx.arrow_size` when present.
+            double const ctx_scale = ml->ctx.scale_factor > 0.0
+                ? ml->ctx.scale_factor : 1.0;
+            double arrow_size = 0.0;
+            if (ml->ctx.arrow_size > 0.0) {
+                arrow_size = ml->ctx.arrow_size;
+            } else if (ml->arrow_size > 0.0) {
+                arrow_size = ml->arrow_size * ctx_scale;
+            } else {
+                arrow_size = 0.18 * ctx_scale;
+            }
+
+            for (BITCODE_BL i = 0; i < ml->ctx.num_leaders; ++i) {
+                Dwg_LEADER_Node const& node = ml->ctx.leaders[i];
+                // Dogleg landing segment lives at the END of each
+                // node — `lastleaderlinepoint` is the landing's
+                // far end (closest to the text), `dogleg_vector` is
+                // the unit vector from the dogleg start toward the
+                // landing, scaled by `dogleg_length`. Compute the
+                // landing endpoints once per node so each leader
+                // line can append the landing-start as its final
+                // waypoint, giving a single connected polyline from
+                // the arrow tip all the way to the text anchor.
+                bool const has_landing = node.has_dogleg
+                                          && node.dogleg_length > 0.0;
+                Point const landing_end{
+                    node.lastleaderlinepoint.x,
+                    node.lastleaderlinepoint.y};
+                Point const landing_start{
+                    landing_end.x - node.dogleg_vector.x * node.dogleg_length,
+                    landing_end.y - node.dogleg_vector.y * node.dogleg_length};
+                for (BITCODE_BL j = 0; j < node.num_lines; ++j) {
+                    Dwg_LEADER_Line const& ln = node.lines[j];
+                    if (ln.points == nullptr || ln.num_points < 1) continue;
+                    Color seg_color = leader_color;
+                    if ((ln.flags & 0x2)
+                        && is_resolvable_cmc(ln.color)) {
+                        seg_color = color_from_cmc(ln.color);
+                    }
+                    // Build the leader's full waypoint chain. AutoCAD
+                    // stores the polyline tip-first, so points[0] is
+                    // the arrow tip and the trailing waypoints walk
+                    // toward the dogleg. When `num_points == 1` the
+                    // leader is straight — the only stored point is
+                    // the tip, and the landing's start is the
+                    // implicit second waypoint.
+                    std::vector<Point> wp;
+                    wp.reserve(ln.num_points + 1);
+                    for (BITCODE_BL k = 0; k < ln.num_points; ++k) {
+                        wp.push_back({ln.points[k].x, ln.points[k].y});
+                    }
+                    if (has_landing) wp.push_back(landing_start);
+                    if (wp.size() < 2) continue;  // can't draw a 1-pt path
+
+                    for (std::size_t k = 0; k + 1 < wp.size(); ++k) {
+                        out.lines.push_back(Line{
+                            xf.apply_point(wp[k].x,     wp[k].y),
+                            xf.apply_point(wp[k + 1].x, wp[k + 1].y),
+                            seg_color, meta.layer_name, thickness,
+                        });
+                        ++out.line_count;
+                    }
+                    // Arrowhead at wp[0] aimed toward wp[1].
+                    Point const tip = wp[0];
+                    Point const next = wp[1];
+                    double dx = next.x - tip.x;
+                    double dy = next.y - tip.y;
+                    double const len = std::sqrt(dx * dx + dy * dy);
+                    if (len > 0.0) { dx /= len; dy /= len; }
+                    Point const tip_w = xf.apply_point(tip.x, tip.y);
+                    Point const dir_w = xf.apply_vector(dx, dy);
+                    double const dlen = std::sqrt(
+                        dir_w.x * dir_w.x + dir_w.y * dir_w.y);
+                    double const ux = dlen > 0 ? dir_w.x / dlen : 1.0;
+                    double const uy = dlen > 0 ? dir_w.y / dlen : 0.0;
+                    double const this_size =
+                        ((ln.flags & 0x10) && ln.arrow_size > 0.0)
+                            ? ln.arrow_size * ctx_scale
+                            : arrow_size;
+                    out.arrows.push_back(ArrowHead{
+                        tip_w, ux, uy,
+                        this_size * xf.scale_factor(),
+                        seg_color, meta.layer_name,
+                    });
+                }
+                // Emit the landing segment once per node — each line
+                // above already terminates at `landing_start`, so the
+                // landing line continues from there to the text.
+                if (has_landing) {
+                    out.lines.push_back(Line{
+                        xf.apply_point(landing_start.x, landing_start.y),
+                        xf.apply_point(landing_end.x,   landing_end.y),
+                        leader_color, meta.layer_name, thickness,
+                    });
+                    ++out.line_count;
+                }
+            }
+
+            // Content text — emit as a Text record. Format codes
+            // (`\P`, `{\W…;…}`, `\f…;`) get stripped by the same
+            // `parse_mtext_format` helper as DWG_TYPE_MTEXT.
+            if (ml->ctx.has_content_txt
+                && ml->ctx.content.txt.default_text != nullptr) {
+                auto const& tx = ml->ctx.content.txt;
+                Color text_color = leader_color;
+                if (is_resolvable_cmc(tx.color)) {
+                    text_color = color_from_cmc(tx.color);
+                }
+                // `ctx.text_height` is already in world units after
+                // the context's scale_factor is applied at save time;
+                // only the parent INSERT/MINSERT chain (carried by
+                // `xf`) still needs to scale through.
+                double const text_height =
+                    (ml->ctx.text_height > 0.0 ? ml->ctx.text_height : 1.0)
+                    * xf.scale_factor();
+                Style style = resolve_entity_style(dwg, tx.style);
+                auto parsed = parse_mtext_format(
+                    read_text_field(dwg, tx.default_text));
+                double const lsf =
+                    tx.line_spacing_factor > 0.0
+                        ? tx.line_spacing_factor : 1.0;
+                // MULTILEADER text alignment — 1=left, 2=centre, 3=right.
+                int const align = static_cast<int>(tx.alignment);
+                TextHAlign const ha =
+                    (align == 2) ? TextHAlign::Center :
+                    (align == 3) ? TextHAlign::Right  :
+                                   TextHAlign::Left;
+                // AutoCAD anchors MULTILEADER text at top-left of the
+                // block; pick Top vertically. PR2 will plumb the
+                // text rotation (`tx.rotation`) through.
+                TextVAlign const va = TextVAlign::Top;
+                out.texts.push_back(Text{
+                    xf.apply_point(tx.location.x, tx.location.y),
+                    text_height,
+                    std::move(parsed.flat),
+                    text_color,
+                    meta.layer_name,
+                    ha, va,
+                    std::move(style),
+                    std::move(parsed.runs),
+                    lsf,
+                    std::move(parsed.tab_stops),
+                });
+                ++out.text_count;
+                // TODO(PR2): once `Text::rotation` exists, set it to
+                // `tx.rotation + xf.rotation()`.
+            }
+            if (ml->ctx.has_content_blk
+                && ml->ctx.content.blk.block_table != nullptr) {
+                auto const& bk = ml->ctx.content.blk;
+                Affine const local =
+                    Affine::translate(bk.location.x, bk.location.y)
+                    .compose(Affine::rotate(bk.rotation))
+                    .compose(Affine::scale_xy(bk.scale.x, bk.scale.y));
+                Affine const child_xf = xf.compose(local);
+                expand_block(dwg, bk.block_table, child_xf, out);
+            }
+
+            ++out.leader_count;
+            break;
+        }
         case DWG_TYPE_SOLID:
         case DWG_TYPE_TRACE: {
             // SOLID and TRACE both store a filled quadrilateral as four
