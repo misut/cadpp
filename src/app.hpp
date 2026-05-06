@@ -25,17 +25,18 @@ namespace cadpp {
 extern std::string g_dwg_path;
 extern std::string g_dwg_layout;
 
-// Canvas size doubles on Android because phenotype's surface is
-// 1:1 with physical pixels — a 1080×2400 phone would only fill the
-// top sliver with a desktop-default-sized canvas.
+// Canvas size is larger on Android because phenotype's surface is
+// 1:1 with physical pixels. The view/layer controls now live in a
+// bottom sheet, so the drawing can claim most of the phone viewport
+// instead of leaving room for an inline selector.
 //
 // Desktop default targets a 1400×1000 GLFW window (set in
 // native/src/main.cpp); the canvas is sized so the layer panel +
 // summary card on the left and the canvas on the right both fit
 // comfortably without horizontal scrolling.
 #ifdef __ANDROID__
-constexpr float kCanvasWidth  = 1000.0f;
-constexpr float kCanvasHeight = 900.0f;
+constexpr float kCanvasWidth  = 1360.0f;
+constexpr float kCanvasHeight = 2200.0f;
 #else
 constexpr float kCanvasWidth  = 1200.0f;
 constexpr float kCanvasHeight = 800.0f;
@@ -58,11 +59,11 @@ struct State {
     // Drives both `parse_file`'s entity filter and the view-selector
     // panel's "active" highlight.
     std::string selected_layout;
-    // Android only: whether the bottom drawer (view + layer picker) is
-    // currently expanded. Native ignores this — its sidebar is always
-    // visible. Defaults to open so the user sees the available views
-    // immediately on first paint.
-    bool drawer_open = true;
+    // Android only: target state for the bottom sheet (view + layer
+    // picker). Native ignores this — its sidebar is always visible.
+    // The Android view keeps the canvas visible and animates the sheet
+    // toward this target.
+    bool drawer_open = false;
     // Layer name -> rendered? Initialised from each layer's
     // `frozen` / `off` flag at parse time so the viewer matches the
     // DWG's stored visibility on first paint, but the user can flip
@@ -122,20 +123,27 @@ struct ToggleLayer {
 
 // Dispatched by the view-selector panel's per-row radio button.
 // update() reloads the file filtered to the chosen layout. On
-// Android the same dispatch flips `drawer_open = false` so the
-// drawer auto-closes after a selection.
+// Android the same dispatch targets `drawer_open = false` so the
+// sheet auto-closes after a selection.
 struct SelectView {
     std::string name;
 };
 
-// Dispatched by the Android drawer's toggle button. update() flips
-// `drawer_open`. Native ignores `drawer_open` so this message is a
-// no-op there (kept in the variant for source compatibility).
+// Dispatched by Android controls that want a specific sheet target
+// state. Using an explicit target avoids backdrop / close / selection
+// racing with a stale toggle.
+struct SetDrawerOpen {
+    bool open = false;
+};
+
+// Legacy Android toggle message. New sheet controls prefer
+// SetDrawerOpen so dismiss and open actions are explicit; this remains
+// for source compatibility with any existing button wiring.
 struct ToggleDrawer {};
 
 using Msg = std::variant<Noop, OpenRequested, FileChosen,
                          Pan, Zoom, ToggleLayer,
-                         SelectView, ToggleDrawer>;
+                         SelectView, SetDrawerOpen, ToggleDrawer>;
 
 void update(State&, Msg);
 

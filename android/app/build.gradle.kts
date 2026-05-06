@@ -3,6 +3,33 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val cadppSamplesDir = providers.gradleProperty("cadppSamplesDir")
+    .orElse(providers.environmentVariable("CADPP_SAMPLES_DIR"))
+    .orElse("${System.getProperty("user.home")}/Downloads/cadpp-samples")
+val generatedCadppSamplesAssets =
+    layout.buildDirectory.dir("generated/cadppSamples/assets")
+
+val copyCadppSamples by tasks.registering(org.gradle.api.tasks.Copy::class) {
+    val sourceDir = cadppSamplesDir.map { file(it) }
+    from(sourceDir) {
+        include("**/*.dwg", "**/*.DWG")
+        into("cadpp-samples")
+    }
+    into(generatedCadppSamplesAssets)
+    includeEmptyDirs = false
+    doFirst {
+        delete(generatedCadppSamplesAssets.get().asFile)
+        val dir = sourceDir.get()
+        if (dir.isDirectory) {
+            logger.lifecycle("cadpp samples: bundling DWG files from $dir")
+        } else {
+            logger.lifecycle(
+                "cadpp samples: $dir not found; using checked-in assets only"
+            )
+        }
+    }
+}
+
 android {
     namespace = "io.github.misut.cadpp"
     compileSdk = 35
@@ -51,6 +78,12 @@ android {
         prefab = true
     }
 
+    sourceSets {
+        getByName("main") {
+            assets.srcDir(generatedCadppSamplesAssets)
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
@@ -72,6 +105,10 @@ android {
             isMinifyEnabled = false
         }
     }
+}
+
+tasks.named("preBuild") {
+    dependsOn(copyCadppSamples)
 }
 
 dependencies {

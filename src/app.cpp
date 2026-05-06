@@ -40,6 +40,10 @@ void apply_platform_theme() {
     t.space_xl  *= 2.0f;
     t.space_2xl *= 2.0f;
     t.space_3xl *= 2.0f;
+    t.toggle_box_size *= 2.75f;
+    t.radius_sm *= 2.0f;
+    t.radius_md *= 2.0f;
+    t.radius_lg *= 2.0f;
     phenotype::set_theme(t);
 }
 #else
@@ -57,6 +61,198 @@ bool perf_enabled() {
 }
 
 using PerfClock = std::chrono::steady_clock;
+
+#ifdef __ANDROID__
+constexpr float kAndroidSheetPeekHeight = 320.0f;
+constexpr float kAndroidSheetTopMargin  = 96.0f;
+
+struct AndroidSheetAnimation {
+    bool initialized = false;
+    bool target_open = false;
+    float start = 0.0f;
+    float current = 0.0f;
+    std::int64_t start_ms = 0;
+};
+
+float bezier_axis(float t, float p1, float p2) noexcept {
+    float const u = 1.0f - t;
+    return 3.0f * u * u * t * p1
+         + 3.0f * u * t * t * p2
+         + t * t * t;
+}
+
+float bezier_axis_derivative(float t, float p1, float p2) noexcept {
+    float const u = 1.0f - t;
+    return 3.0f * u * u * p1
+         + 6.0f * u * t * (p2 - p1)
+         + 3.0f * t * t * (1.0f - p2);
+}
+
+float cubic_bezier(float x, float x1, float y1,
+                   float x2, float y2) noexcept {
+    if (x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+
+    float t = x;
+    for (int i = 0; i < 6; ++i) {
+        float const estimate = bezier_axis(t, x1, x2) - x;
+        float const slope = bezier_axis_derivative(t, x1, x2);
+        if (slope == 0.0f) break;
+        t -= estimate / slope;
+        if (t < 0.0f || t > 1.0f) {
+            t = x;
+            break;
+        }
+    }
+    float lo = 0.0f;
+    float hi = 1.0f;
+    for (int i = 0; i < 8; ++i) {
+        float const estimate = bezier_axis(t, x1, x2);
+        if (estimate < x) lo = t;
+        else hi = t;
+        t = (lo + hi) * 0.5f;
+    }
+    return bezier_axis(t, y1, y2);
+}
+
+float material_enter_sheet_easing(float x) noexcept {
+    // Material deceleration curve: LinearOutSlowInInterpolator.
+    return cubic_bezier(x, 0.0f, 0.0f, 0.2f, 1.0f);
+}
+
+float material_exit_sheet_easing(float x) noexcept {
+    // Material acceleration curve: FastOutLinearInInterpolator.
+    return cubic_bezier(x, 0.4f, 0.0f, 1.0f, 1.0f);
+}
+
+float android_sheet_progress(bool target_open) {
+    auto& anim = phenotype::framework_local<AndroidSheetAnimation>();
+    auto const now = phenotype::detail::steady_ms();
+    float const target = target_open ? 1.0f : 0.0f;
+
+    if (!anim.initialized) {
+        anim.initialized = true;
+        anim.target_open = target_open;
+        anim.start = target;
+        anim.current = target;
+        anim.start_ms = now;
+        return target;
+    }
+
+    if (anim.target_open != target_open) {
+        anim.target_open = target_open;
+        anim.start = anim.current;
+        anim.start_ms = now;
+    }
+
+    int const duration_ms = target_open ? 225 : 195;
+    float linear = static_cast<float>(now - anim.start_ms)
+                 / static_cast<float>(duration_ms);
+    if (linear < 0.0f) linear = 0.0f;
+    if (linear > 1.0f) linear = 1.0f;
+
+    float const eased = target_open
+        ? material_enter_sheet_easing(linear)
+        : material_exit_sheet_easing(linear);
+    anim.current = anim.start + (target - anim.start) * eased;
+
+    float const delta = anim.current > target
+        ? anim.current - target
+        : target - anim.current;
+    if (linear < 1.0f && delta > 0.001f) {
+        phenotype::detail::g_app.has_active_animations = true;
+    } else {
+        anim.current = target;
+    }
+    return anim.current;
+}
+
+float android_viewport_height() noexcept {
+    float h = phenotype::detail::g_app.debug_viewport_height;
+    return h > 0.0f ? h : 1200.0f;
+}
+
+float android_sheet_height(float viewport_h) noexcept {
+    float max_h = viewport_h - kAndroidSheetTopMargin;
+    if (max_h < kAndroidSheetPeekHeight + 160.0f) {
+        max_h = viewport_h;
+    }
+    float h = viewport_h * 0.72f;
+    if (h < 680.0f) h = 680.0f;
+    if (h > max_h) h = max_h;
+    return h;
+}
+
+void android_fixed_block(float height, phenotype::Color background) {
+    if (height <= 0.0f) return;
+    auto h = phenotype::detail::alloc_node();
+    auto& node = phenotype::detail::node_at(h);
+    node.style.fixed_height = height;
+    node.background = background;
+    node.focusable = false;
+    phenotype::detail::attach_to_scope(h);
+}
+
+template <typename M>
+void android_click_block(float height, phenotype::Color background,
+                         M message, std::string label) {
+    if (height <= 0.0f) return;
+    auto h = phenotype::detail::alloc_node();
+    auto& node = phenotype::detail::node_at(h);
+    auto const id = static_cast<unsigned int>(
+        phenotype::detail::g_app.callbacks.size());
+    node.style.fixed_height = height;
+    node.background = background;
+    node.callback_id = id;
+    node.cursor_type = 1;
+    node.focusable = false;
+    node.interaction_role = phenotype::InteractionRole::Button;
+    node.debug_semantic_role = "button";
+    node.debug_semantic_label = std::move(label);
+    node.debug_semantic_callback_id = id;
+
+    phenotype::detail::g_app.callbacks.push_back(
+        [msg = Msg{std::move(message)}] {
+            phenotype::detail::post<Msg>(msg);
+            phenotype::detail::trigger_rebuild();
+        });
+    phenotype::detail::g_app.callback_roles.push_back(
+        phenotype::InteractionRole::Button);
+    phenotype::detail::attach_to_scope(h);
+}
+
+void android_handle_bar() {
+    using namespace phenotype;
+    layout::row([&] {
+        auto h = phenotype::detail::alloc_node();
+        auto& node = phenotype::detail::node_at(h);
+        node.style.max_width = 96.0f;
+        node.style.fixed_height = 8.0f;
+        node.background = phenotype::Color{107, 114, 128, 160};
+        node.border_radius = phenotype::detail::g_app.theme.radius_full;
+        node.focusable = false;
+        phenotype::detail::attach_to_scope(h);
+    }, SpaceToken::Xs, CrossAxisAlignment::Center, MainAxisAlignment::Center);
+}
+
+template <typename F>
+void android_sheet_surface(F&& builder) {
+    auto h = phenotype::detail::alloc_node();
+    auto& node = phenotype::detail::node_at(h);
+    auto const& t = phenotype::detail::g_app.theme;
+    node.style.flex_direction = phenotype::FlexDirection::Column;
+    node.style.gap = t.space_md;
+    node.style.padding[0] = t.space_lg;
+    node.style.padding[1] = t.space_lg;
+    node.style.padding[2] = t.space_lg;
+    node.style.padding[3] = t.space_lg;
+    node.background = t.surface;
+    node.border_color = t.border;
+    node.border_width = 1.0f;
+    node.border_radius = t.radius_lg;
+    phenotype::detail::open_container(h, std::forward<F>(builder));
+}
+#endif
 
 double elapsed_ms(PerfClock::time_point a,
                   PerfClock::time_point b) {
@@ -216,13 +412,15 @@ void update(State& state, Msg msg) {
         } else if constexpr (std::is_same_v<T, SelectView>) {
             // Reload the file filtered to the chosen layout. The
             // existing source_path is reused — only the layout filter
-            // changes between renders. On Android the drawer
-            // auto-closes after a selection so the user immediately
-            // sees the new view; on native the drawer flag is unused.
+            // changes between renders. On Android the sheet
+            // auto-closes after a selection so the new view stays
+            // visible while the picker slides away.
             state.load(state.source_path, m.name);
 #ifdef __ANDROID__
             state.drawer_open = false;
 #endif
+        } else if constexpr (std::is_same_v<T, SetDrawerOpen>) {
+            state.drawer_open = m.open;
         } else if constexpr (std::is_same_v<T, ToggleDrawer>) {
             state.drawer_open = !state.drawer_open;
         }
@@ -270,21 +468,29 @@ void on_canvas_gesture(phenotype::GestureEvent const& ev) {
 
 namespace {
 
+void render_layer_contents(State const& state, bool show_title) {
+    using namespace phenotype;
+    if (state.entities.layers.empty()) return;
+    if (show_title) {
+        widget::text("Layers", TextSize::Body);
+    }
+    layout::column([&] {
+        for (auto const& layer : state.entities.layers) {
+            auto it = state.layer_visible.find(layer.name);
+            bool const visible =
+                (it == state.layer_visible.end()) ? true : it->second;
+            widget::checkbox<Msg>(
+                layer.name, visible,
+                ToggleLayer{layer.name});
+        }
+    }, SpaceToken::Xs);
+}
+
 void render_layer_panel(State const& state) {
     using namespace phenotype;
     if (state.entities.layers.empty()) return;
     layout::card([&] {
-        widget::text("Layers", TextSize::Body);
-        layout::column([&] {
-            for (auto const& layer : state.entities.layers) {
-                auto it = state.layer_visible.find(layer.name);
-                bool const visible =
-                    (it == state.layer_visible.end()) ? true : it->second;
-                widget::checkbox<Msg>(
-                    layer.name, visible,
-                    ToggleLayer{layer.name});
-            }
-        }, SpaceToken::Xs);
+        render_layer_contents(state, true);
     });
 }
 
@@ -301,7 +507,7 @@ void render_layer_panel(State const& state) {
 // it as "2D View" in the picker. Match that convention so the picker
 // reads the same as the reference viewer. `SelectView` still posts
 // the on-disk layout name so `parse_file` can match it.
-void render_view_panel(State const& state) {
+void render_view_picker_contents(State const& state, bool show_title) {
     using namespace phenotype;
     if (state.entities.layouts.empty()) return;
     auto const display_name = [](Layout const& l) -> std::string {
@@ -313,34 +519,42 @@ void render_view_panel(State const& state) {
             display_name(l), SelectView{l.name},
             active ? ButtonVariant::Primary : ButtonVariant::Default);
     };
-    layout::card([&] {
+    if (show_title) {
         widget::text("Views", TextSize::Body);
-        bool any_sheet = false;
-        for (auto const& l : state.entities.layouts) {
-            if (!l.is_model) { any_sheet = true; break; }
-        }
-        if (any_sheet) {
-            widget::text("Sheets", TextSize::Small, TextColor::Muted);
-            layout::column([&] {
-                for (auto const& l : state.entities.layouts) {
-                    if (l.is_model) continue;
-                    button_for_layout(l);
-                }
-            }, SpaceToken::Xs);
-        }
-        bool any_model = false;
-        for (auto const& l : state.entities.layouts) {
-            if (l.is_model) { any_model = true; break; }
-        }
-        if (any_model) {
-            widget::text("Model", TextSize::Small, TextColor::Muted);
-            layout::column([&] {
-                for (auto const& l : state.entities.layouts) {
-                    if (!l.is_model) continue;
-                    button_for_layout(l);
-                }
-            }, SpaceToken::Xs);
-        }
+    }
+    bool any_sheet = false;
+    for (auto const& l : state.entities.layouts) {
+        if (!l.is_model) { any_sheet = true; break; }
+    }
+    if (any_sheet) {
+        widget::text("Sheets", TextSize::Small, TextColor::Muted);
+        layout::column([&] {
+            for (auto const& l : state.entities.layouts) {
+                if (l.is_model) continue;
+                button_for_layout(l);
+            }
+        }, SpaceToken::Xs);
+    }
+    bool any_model = false;
+    for (auto const& l : state.entities.layouts) {
+        if (l.is_model) { any_model = true; break; }
+    }
+    if (any_model) {
+        widget::text("Model", TextSize::Small, TextColor::Muted);
+        layout::column([&] {
+            for (auto const& l : state.entities.layouts) {
+                if (!l.is_model) continue;
+                button_for_layout(l);
+            }
+        }, SpaceToken::Xs);
+    }
+}
+
+void render_view_panel(State const& state) {
+    using namespace phenotype;
+    if (state.entities.layouts.empty()) return;
+    layout::card([&] {
+        render_view_picker_contents(state, true);
     });
 }
 
@@ -458,6 +672,55 @@ auto canvas_painter(State const& state) {
         }
     };
 }
+
+#ifdef __ANDROID__
+void render_android_bottom_sheet(State const& state) {
+    using namespace phenotype;
+
+    float const progress = android_sheet_progress(state.drawer_open);
+    float const viewport_h = android_viewport_height();
+    float const sheet_h = android_sheet_height(viewport_h);
+    float const visible_h = kAndroidSheetPeekHeight
+        + (sheet_h - kAndroidSheetPeekHeight) * progress;
+    float top_h = viewport_h - visible_h;
+    if (top_h < 0.0f) top_h = 0.0f;
+
+    unsigned char const scrim_alpha = static_cast<unsigned char>(
+        progress <= 0.0f ? 0.0f : progress * 51.0f + 0.5f);
+    phenotype::Color const scrim{0, 0, 0, scrim_alpha};
+    layout::overlay([&] {
+        if (progress > 0.02f || state.drawer_open) {
+            android_click_block(top_h, scrim, SetDrawerOpen{false}, "Close views");
+        } else {
+            android_fixed_block(top_h, phenotype::Color{0, 0, 0, 0});
+        }
+
+        android_sheet_surface([&] {
+            android_handle_bar();
+            if (!state.drawer_open && progress < 0.05f) {
+                widget::button<Msg>("Views", SetDrawerOpen{true},
+                                    ButtonVariant::Primary);
+                return;
+            }
+
+            layout::row([&] {
+                widget::text("Views", TextSize::Body);
+                layout::weighted(1.0f, [] {});
+                widget::button<Msg>("Close", SetDrawerOpen{false},
+                                    ButtonVariant::Default);
+            }, SpaceToken::Md, CrossAxisAlignment::Center,
+               MainAxisAlignment::SpaceBetween);
+
+            float body_h = sheet_h - 220.0f;
+            if (body_h < 280.0f) body_h = 280.0f;
+            layout::scroll_view(body_h, [&] {
+                render_view_picker_contents(state, false);
+                render_layer_contents(state, true);
+            }, SpaceToken::Md);
+        });
+    });
+}
+#endif
 } // namespace
 
 void view(State const& state) {
@@ -470,24 +733,18 @@ void view(State const& state) {
             widget::button<Msg>("Open...", OpenRequested{},
                                 ButtonVariant::Primary);
 #ifdef __ANDROID__
-            // Bottom drawer: when open, replace the canvas with the
-            // view + layer pickers + a "Close" button at the top of
-            // the sheet. When closed, show the canvas with a "Views"
-            // toggle anchored beneath it (pull-up handle ergonomics).
-            // Auto-close on selection happens in update() / SelectView.
-            if (state.drawer_open) {
-                widget::button<Msg>("Close", ToggleDrawer{},
-                                    ButtonVariant::Default);
-                render_view_panel(state);
-                render_layer_panel(state);
-            } else {
+            // Android keeps the drawing visible and presents view/layer
+            // controls as a Material-style bottom sheet overlay. The
+            // sheet itself is emitted after the main tree so it paints
+            // above the canvas and can animate without canvas flash.
+            layout::row([&] {
                 widget::canvas(kCanvasWidth, kCanvasHeight,
                                canvas_painter(state),
                                &on_canvas_gesture,
                                hash_canvas_inputs(state));
-                widget::button<Msg>("Views", ToggleDrawer{},
-                                    ButtonVariant::Default);
-            }
+            }, SpaceToken::Xs, CrossAxisAlignment::Center,
+               MainAxisAlignment::Center);
+            render_android_bottom_sheet(state);
 #else
             widget::text(
                 "Slab 9 — view selector + per-layout entity filter",
