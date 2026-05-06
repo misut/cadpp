@@ -611,14 +611,33 @@ std::uint64_t hash_canvas_inputs(State const& state) noexcept {
     vec_print(state.entities.texts);
     h = mix(h, state.entities.ok ? 1ULL : 0ULL);
     // Viewport transform: pan/zoom drives every numeric field.
+    //
+    // Quantise float pan/zoom inputs before hashing so sub-pixel finger
+    // jitter (Android touch sample rate is often 240+ Hz, well above
+    // display refresh) does not invalidate phenotype's paint cache on
+    // every motion event. Pad is rounded to a 1/8-px grid, scale to a
+    // 1e-5 grid; both are smaller than visible motion but large
+    // enough to absorb noise. The bbox fields are integer-stable from
+    // parse but pass through the same quantiser for safety.
+    //
+    // During a deliberate pan, pad_x changes by integer pixels per
+    // frame so the cache still misses — that case is intentionally
+    // unaffected. The win is collapsing redundant rebuilds when the
+    // user holds a finger steady or makes sub-pixel adjustments.
     auto const& t = state.transform;
-    h = mix(h, bits(t.scale));
-    h = mix(h, bits(t.pad_x));
-    h = mix(h, bits(t.pad_y));
-    h = mix(h, bits(t.bbox.min_x));
-    h = mix(h, bits(t.bbox.min_y));
-    h = mix(h, bits(t.bbox.max_x));
-    h = mix(h, bits(t.bbox.max_y));
+    auto qpad = [](double v) noexcept {
+        return static_cast<std::int64_t>(std::llround(v * 8.0));
+    };
+    auto qscale = [](double s) noexcept {
+        return static_cast<std::int64_t>(std::llround(s * 100000.0));
+    };
+    h = mix(h, static_cast<std::uint64_t>(qscale(t.scale)));
+    h = mix(h, static_cast<std::uint64_t>(qpad(t.pad_x)));
+    h = mix(h, static_cast<std::uint64_t>(qpad(t.pad_y)));
+    h = mix(h, static_cast<std::uint64_t>(qpad(t.bbox.min_x)));
+    h = mix(h, static_cast<std::uint64_t>(qpad(t.bbox.min_y)));
+    h = mix(h, static_cast<std::uint64_t>(qpad(t.bbox.max_x)));
+    h = mix(h, static_cast<std::uint64_t>(qpad(t.bbox.max_y)));
     // Selected layout name — drives entity filter at parse time.
     for (char c : state.selected_layout)
         h = mix(h, static_cast<std::uint64_t>(static_cast<unsigned char>(c)));
