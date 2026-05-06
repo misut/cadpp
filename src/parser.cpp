@@ -1466,6 +1466,50 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             ++out.arc_count;
             break;
         }
+        case DWG_TYPE_ATTRIB: {
+            // ATTRIB — attribute reference attached to an INSERT,
+            // carrying the displayed value that overrides the
+            // referenced ATTDEF's default. Field shape mirrors TEXT
+            // (ins_pt / alignment_pt / height / rotation / text_value
+            // / dataflags / horiz_alignment / vert_alignment / style),
+            // so the extraction is the same as `DWG_TYPE_TEXT`. The
+            // INSERT case (below) walks `ins->attribs[]` and dispatches
+            // each ATTRIB through here. Entity-level invisible bit
+            // (flags & 1) suppresses display.
+            auto const* a = obj->tio.entity->tio.ATTRIB;
+            if (!a || !a->text_value) { ++out.unknown_entities; break; }
+            if (a->flags & 0x1) { break; }  // invisible — drop silently.
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            int const h_align = static_cast<int>(a->horiz_alignment);
+            int const v_align = static_cast<int>(a->vert_alignment);
+            bool const has_align_pt = (a->dataflags & 0x2) == 0;
+            Point const anchor = (has_align_pt
+                                  && (h_align != 0 || v_align != 0))
+                ? Point{a->alignment_pt.x, a->alignment_pt.y}
+                : Point{a->ins_pt.x, a->ins_pt.y};
+            TextHAlign const ha =
+                (h_align == 1) ? TextHAlign::Center :
+                (h_align == 2) ? TextHAlign::Right  :
+                (h_align == 4) ? TextHAlign::Middle :
+                                 TextHAlign::Left;
+            TextVAlign const va =
+                (v_align == 1) ? TextVAlign::Bottom :
+                (v_align == 2) ? TextVAlign::Middle :
+                (v_align == 3) ? TextVAlign::Top    :
+                                 TextVAlign::Baseline;
+            Style style = resolve_entity_style(dwg, a->style);
+            out.texts.push_back(Text{
+                xf.apply_point(anchor.x, anchor.y),
+                a->height * xf.scale_factor(),
+                read_text_field(dwg, a->text_value),
+                meta.color,
+                std::move(meta.layer_name),
+                ha, va,
+                std::move(style),
+            });
+            ++out.text_count;
+            break;
+        }
         case DWG_TYPE_TEXT: {
             auto const* t = obj->tio.entity->tio.TEXT;
             if (!t || !t->text_value) { ++out.unknown_entities; break; }
@@ -1805,6 +1849,30 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 .compose(Affine::scale_xy(ins->scale.x, ins->scale.y));
             Affine const child_xf = xf.compose(local);
             expand_block(dwg, ins->block_header, child_xf, out);
+            // Walk attached ATTRIBs (attribute-value overrides for the
+            // referenced block's ATTDEFs). Each ATTRIB is its own
+            // entity object in the database — `ins->attribs` is a
+            // handle array indexed by `ins->num_owned`. We dispatch
+            // each ATTRIB through `extract_entity_xf` under the
+            // *parent* xf (NOT child_xf) because ATTRIBs are stored
+            // with paper-space-absolute coordinates, already laid out
+            // for the INSERT instance — the block-internal ATTDEFs
+            // they override carry only the symbolic prompt. View
+            // labels like "STAIR SECTION 1" / "STAIR DETAIL 2" /
+            // "STAIR SECTIONS" in the architectural sample come
+            // through this path (paper-space callout INSERTs whose
+            // ATTRIBs hold the per-instance VIEWNAME / SHEET_CONTENT
+            // values).
+            if (ins->has_attribs && ins->attribs != nullptr) {
+                for (BITCODE_BL i = 0; i < ins->num_owned; ++i) {
+                    BITCODE_H ah = ins->attribs[i];
+                    if (ah == nullptr) continue;
+                    Dwg_Object* aobj = dwg_ref_object(dwg, ah);
+                    if (aobj == nullptr
+                        || aobj->supertype != DWG_SUPERTYPE_ENTITY) continue;
+                    extract_entity_xf(dwg, aobj, xf, out);
+                }
+            }
             ++out.insert_count;
             break;
         }
