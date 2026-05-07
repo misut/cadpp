@@ -490,8 +490,21 @@ MtextParseResult parse_mtext_format(std::string_view in) {
     return out;
 }
 
+// `block_color` carries the parent INSERT's resolved colour so we can
+// honour AutoCAD's "layer-0 inheritance" rule at resolution time:
+// entities defined inside a block on layer "0" with a BYLAYER colour
+// adopt the parent INSERT's effective colour at instantiation,
+// regardless of layer 0's own stored ACI 7. Default-constructed
+// (`Color{}` with alpha == 0) means "no parent block context" — the
+// resolver behaves exactly as it always did. Entities with an
+// explicit colour skip the inheritance path entirely, so a layer-0
+// LWPOLYLINE drawn in cyan stays cyan even when its parent INSERT
+// resolves blue. (This is what fixes the architectural sample's
+// revision-marker triangle, which lives in `Rev` block on layer 0
+// but carries an explicit ACI 4.)
 EntityMetadata resolve_entity_metadata(Dwg_Data const* dwg,
-                                       Dwg_Object_Entity const* ent) {
+                                       Dwg_Object_Entity const* ent,
+                                       Color block_color = Color{}) {
     EntityMetadata out{};
     if (ent == nullptr) return out;
 
@@ -502,11 +515,21 @@ EntityMetadata resolve_entity_metadata(Dwg_Data const* dwg,
 
     if (is_resolvable_cmc(ent->color)) {
         out.color = color_from_cmc(ent->color);
+    } else if (block_color.a != 0 && out.layer_name == "0") {
+        // BYLAYER on layer "0" inside a block instance — adopt the
+        // parent INSERT's effective colour instead of layer 0's
+        // ACI 7 (which renders as default ink / black on cad++'s
+        // light canvas). This is the AutoCAD-specific "layer-0
+        // inheritance" rule — without it, callout glyphs whose
+        // geometry sits on layer 0 (`_DetailCallout`'s circle +
+        // underline, view-label ATTRIBs) drop their parent block's
+        // intended colour.
+        out.color = block_color;
     } else if (layer != nullptr && is_resolvable_cmc(layer->color)) {
-        // BYLAYER (or BYBLOCK / ACI-7 — same code path here) — fall
-        // back to the layer's stored colour. With Slab 4 in place this
-        // is what makes ACI-coded layer colours actually appear in the
-        // viewer instead of rendering as flat near-black ink.
+        // Normal BYLAYER (or BYBLOCK / ACI-7) fallback. With Slab 4
+        // in place this is what makes ACI-coded layer colours
+        // actually appear in the viewer instead of rendering as
+        // flat near-black ink.
         out.color = color_from_cmc(layer->color);
     }
     return out;
@@ -1029,8 +1052,15 @@ char const* version_string(unsigned int v) {
 // a block of leaf primitives, and pathological cycles (an INSERT
 // reaching a block that ultimately contains the same INSERT again)
 // would only manifest in malformed DWGs.
+// `block_color` carries the parent INSERT's resolved colour so
+// children defined on layer "0" with BYLAYER inherit through the
+// AutoCAD-specific layer-0 rule (`resolve_entity_metadata` does
+// the actual decision). Non-INSERT call sites pass the default
+// `Color{}` (alpha == 0 → no parent block context) and the
+// resolver behaves exactly as it did before.
 void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
-                       Affine const& xf, Entities& out);
+                       Affine const& xf, Entities& out,
+                       Color block_color = Color{});
 
 // Slab 5 — walk every entity owned by the BLOCK_HEADER referenced by
 // `block_ref`, dispatching each child through `extract_entity_xf` so
@@ -1039,8 +1069,13 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
 // call) and every `DWG_TYPE_DIMENSION_*` variant (whose `block`
 // holds a precomputed `*D###` anonymous block of dimension lines /
 // arcs / text and inherits `xf` verbatim — no extra transform).
+// `block_color` threads the parent INSERT's resolved colour for
+// the layer-0 inheritance rule; DIMENSION expansions pass the
+// default `Color{}` since dimension geometry never relies on
+// layer-0 inheritance.
 void expand_block(Dwg_Data* dwg, BITCODE_H block_ref,
-                  Affine const& xf, Entities& out) {
+                  Affine const& xf, Entities& out,
+                  Color block_color = Color{}) {
     if (block_ref == nullptr) return;
     Dwg_Object* block_obj = dwg_ref_object(dwg, block_ref);
     if (block_obj == nullptr
@@ -1054,7 +1089,7 @@ void expand_block(Dwg_Data* dwg, BITCODE_H block_ref,
         Dwg_Object* child = dwg_ref_object(dwg, href);
         if (child == nullptr) continue;
         if (child->supertype != DWG_SUPERTYPE_ENTITY) continue;
-        extract_entity_xf(dwg, child, xf, out);
+        extract_entity_xf(dwg, child, xf, out, block_color);
     }
 }
 
@@ -1369,13 +1404,14 @@ void expand_viewport(Dwg_Data* dwg,
 }
 
 void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
-                       Affine const& xf, Entities& out) {
+                       Affine const& xf, Entities& out,
+                       Color block_color) {
     auto const fixedtype = static_cast<int>(obj->fixedtype);
     switch (fixedtype) {
         case DWG_TYPE_LINE: {
             auto const* line = obj->tio.entity->tio.LINE;
             if (!line) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -1402,7 +1438,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_CIRCLE: {
             auto const* c = obj->tio.entity->tio.CIRCLE;
             if (!c) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -1438,7 +1474,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_ARC: {
             auto const* a = obj->tio.entity->tio.ARC;
             if (!a) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -1479,7 +1515,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const* a = obj->tio.entity->tio.ATTRIB;
             if (!a || !a->text_value) { ++out.unknown_entities; break; }
             if (a->flags & 0x1) { break; }  // invisible — drop silently.
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             int const h_align = static_cast<int>(a->horiz_alignment);
             int const v_align = static_cast<int>(a->vert_alignment);
             bool const has_align_pt = (a->dataflags & 0x2) == 0;
@@ -1521,7 +1557,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_TEXT: {
             auto const* t = obj->tio.entity->tio.TEXT;
             if (!t || !t->text_value) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             // DWG TEXT carries two anchor points: `ins_pt` (the
             // baseline-left for the default Left/Baseline alignment)
             // and `alignment_pt` (used when horiz_alignment != 0 or
@@ -1581,7 +1617,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_MTEXT: {
             auto const* m = obj->tio.entity->tio.MTEXT;
             if (!m || !m->text) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             // MTEXT `attachment` enum picks the corner the
             // ins_pt anchors at (1=top-left, 2=top-centre, 3=top-
             // right, 4=middle-left, 5=middle-centre, 6=middle-right,
@@ -1636,13 +1672,22 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             if (!p || !p->points || p->num_points < 2) {
                 ++out.unknown_entities; break;
             }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             Color const color = meta.color;
             std::string const layer_name = meta.layer_name;
             auto const npts = p->num_points;
-            bool const closed = (p->flag & 0x1) != 0;
+            // LibreDWG packs LWPOLYLINE's optional-field bits AND the
+            // DXF group-70 polyline flags into the same `flag` word.
+            // The DXF "closed" bit (DXF value 1) lives at 0x200 in
+            // this internal encoding (see `FLAG_LWPOLYLINE_CLOSED =
+            // 512` in libredwg's `dwg.h`). Bit 0 is `HAS_EXTRUSION`,
+            // not closed — the previous `& 0x1` test mis-classified
+            // every closed LWPOLYLINE as open, dropping the closing
+            // segment (e.g. the architectural sample's revision-
+            // marker triangle visibly missed one edge).
+            bool const closed = (p->flag & 0x200) != 0;
 
             // Detect any non-zero bulge: those segments need to render
             // as actual circular arcs, not straight chords. The whole
@@ -1739,7 +1784,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // not a world position). Minor ratio is preserved under
             // similarity transforms; non-uniform INSERT scale would
             // distort the ellipse — accepted approximation.
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             float const thickness =
                 resolve_entity_lineweight_px(obj->tio.entity);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
@@ -1778,7 +1823,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         case DWG_TYPE_SPLINE: {
             auto const* s = obj->tio.entity->tio.SPLINE;
             if (!s) { ++out.unknown_entities; break; }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             Spline sp{};
             sp.color      = meta.color;
             sp.layer_name = std::move(meta.layer_name);
@@ -1879,33 +1924,24 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // inside a block on layer "0" with a BYLAYER colour adopt
             // the parent INSERT's effective colour at instantiation
             // time. The rule covers BOTH the block's owned geometry
-            // (lines / arcs / circles / hatches that come out of
-            // `expand_block` below) AND the per-INSERT ATTRIBs
-            // (walked separately further down — ATTDEFs become
-            // ATTRIBs whose layer field carries over from the block
-            // definition). Snapshot every entity vector size first,
-            // run the two walks, then post-patch the layer-0 ones.
+            // (lines / arcs / circles / hatches walked through
+            // `expand_block`) AND the per-INSERT ATTRIBs (walked
+            // separately — ATTDEFs become ATTRIBs whose layer field
+            // carries over from the block definition). The decision
+            // happens at resolve time inside `resolve_entity_metadata`
+            // so explicit colours are preserved untouched: a
+            // layer-0 LWPOLYLINE drawn in cyan (the architectural
+            // sample's revision-marker triangle) keeps its cyan even
+            // when its parent INSERT resolves blue.
             //
-            // Without this, the architectural sample's
-            // `_DetailCallout` block (CIRCLE around the view-number,
-            // baseline LINE under the label, plus VIEWNAME ATTRIBs)
-            // resolves all four pieces to layer 0's ACI 7 = black,
-            // even though the INSERT itself sits on PS_Annot (ACI 5
-            // = blue) and the reference renders the whole callout in
-            // matching blue.
+            // Resolve the INSERT's effective colour once (honouring
+            // any outer block context we inherited) and thread it
+            // through both walks as the new `block_color`.
             auto const insert_meta =
-                resolve_entity_metadata(dwg, obj->tio.entity);
-            std::size_t const lines_before     = out.lines.size();
-            std::size_t const arcs_before      = out.arcs.size();
-            std::size_t const texts_before     = out.texts.size();
-            std::size_t const bulged_before    = out.bulged_polylines.size();
-            std::size_t const ellipses_before  = out.ellipses.size();
-            std::size_t const splines_before   = out.splines.size();
-            std::size_t const solids_before    = out.solid_quads.size();
-            std::size_t const hatches_before   = out.hatches.size();
-            std::size_t const arrows_before    = out.arrows.size();
+                resolve_entity_metadata(dwg, obj->tio.entity, block_color);
 
-            expand_block(dwg, ins->block_header, child_xf, out);
+            expand_block(dwg, ins->block_header, child_xf, out,
+                         insert_meta.color);
 
             // Walk attached ATTRIBs (attribute-value overrides for
             // the block's ATTDEFs). Each ATTRIB is its own entity
@@ -1914,7 +1950,9 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // with paper-space-absolute coordinates already laid out
             // for the INSERT instance, so dispatch them under the
             // *parent* xf (NOT child_xf). View labels like "STAIR
-            // SECTION 1" / "STAIR DETAIL 2" come through here.
+            // SECTION 1" / "STAIR DETAIL 2" come through here and
+            // pick up the INSERT's effective colour through the
+            // same layer-0 path.
             if (ins->has_attribs && ins->attribs != nullptr) {
                 for (BITCODE_BL i = 0; i < ins->num_owned; ++i) {
                     BITCODE_H ah = ins->attribs[i];
@@ -1922,41 +1960,9 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     Dwg_Object* aobj = dwg_ref_object(dwg, ah);
                     if (aobj == nullptr
                         || aobj->supertype != DWG_SUPERTYPE_ENTITY) continue;
-                    extract_entity_xf(dwg, aobj, xf, out);
+                    extract_entity_xf(dwg, aobj, xf, out,
+                                      insert_meta.color);
                 }
-            }
-
-            // Patch every newly emitted entity whose resolved layer
-            // is "0". Layer 0 inside a block definition is the
-            // AutoCAD-special inheritance layer — its content always
-            // takes the parent INSERT's effective colour at draw
-            // time, regardless of what colour `color_from_cmc` would
-            // return for layer 0's stored ACI 7 (which renders as
-            // black on cadpp's light canvas). Entities on any other
-            // layer keep their own resolved colour, including
-            // explicit ACI overrides on title-block ATTRIBs.
-            //
-            // (An earlier draft also gated on `color.a == 0` thinking
-            // unresolved colours stay alpha-zero, but ACI 7 resolves
-            // to fully-opaque black via the palette path, so the
-            // gate suppressed every legitimate inheritance.)
-            if (insert_meta.color.a != 0) {
-                auto patch = [&](auto& vec, std::size_t before) {
-                    for (std::size_t i = before; i < vec.size(); ++i) {
-                        if (vec[i].layer_name == "0") {
-                            vec[i].color = insert_meta.color;
-                        }
-                    }
-                };
-                patch(out.lines,             lines_before);
-                patch(out.arcs,              arcs_before);
-                patch(out.texts,             texts_before);
-                patch(out.bulged_polylines,  bulged_before);
-                patch(out.ellipses,          ellipses_before);
-                patch(out.splines,           splines_before);
-                patch(out.solid_quads,       solids_before);
-                patch(out.hatches,           hatches_before);
-                patch(out.arrows,            arrows_before);
             }
             ++out.insert_count;
             break;
@@ -1980,13 +1986,19 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 .compose(Affine::rotate(mins->rotation))
                 .compose(Affine::scale_xy(mins->scale.x, mins->scale.y));
             Affine const base_xf = xf.compose(local);
+            // Same layer-0 inheritance rule as DWG_TYPE_INSERT —
+            // resolve the MINSERT's effective colour once, then
+            // hand each cell expansion the same block_color.
+            auto const minsert_meta =
+                resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             for (int row = 0; row < rows; ++row) {
                 for (int col = 0; col < cols; ++col) {
                     Affine const cell_offset = Affine::translate(
                         static_cast<double>(col) * mins->col_spacing,
                         static_cast<double>(row) * mins->row_spacing);
                     Affine const cell_xf = base_xf.compose(cell_offset);
-                    expand_block(dwg, mins->block_header, cell_xf, out);
+                    expand_block(dwg, mins->block_header, cell_xf, out,
+                                 minsert_meta.color);
                 }
             }
             ++out.minsert_count;
@@ -2029,7 +2041,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 || ld->num_points < 2) {
                 ++out.unknown_entities; break;
             }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             auto dashes = resolve_entity_dashes(dwg, obj->tio.entity);
             float const thickness = 1.0f;
             for (BITCODE_BL i = 0; i + 1 < ld->num_points; ++i) {
@@ -2092,7 +2104,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const* ml = obj->tio.entity->tio.MULTILEADER;
             if (ml == nullptr) { ++out.unknown_entities; break; }
 
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             // `line_color` overrides the entity colour for leader
             // strokes (entity-level colour usually resolves BYLAYER).
             Color leader_color = meta.color;
@@ -2285,7 +2297,15 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     .compose(Affine::rotate(bk.rotation))
                     .compose(Affine::scale_xy(bk.scale.x, bk.scale.y));
                 Affine const child_xf = xf.compose(local);
-                expand_block(dwg, bk.block_table, child_xf, out);
+                // The MULTILEADER content block follows the same
+                // layer-0 inheritance rule as a normal INSERT — its
+                // effective colour is the leader's resolved line/
+                // text colour (`leader_color`, computed earlier in
+                // this case). Pass it as block_color so layer-0
+                // BYLAYER glyphs inside the content block pick up
+                // the leader colour, not layer 0's ACI 7.
+                expand_block(dwg, bk.block_table, child_xf, out,
+                             leader_color);
             }
 
             ++out.leader_count;
@@ -2311,7 +2331,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             auto const& c2 = sol ? sol->corner2 : tra->corner2;
             auto const& c3 = sol ? sol->corner3 : tra->corner3;
             auto const& c4 = sol ? sol->corner4 : tra->corner4;
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             SolidQuad quad{};
             quad.color      = meta.color;
             quad.layer_name = std::move(meta.layer_name);
@@ -2330,7 +2350,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             if (!h || h->num_paths == 0 || h->paths == nullptr) {
                 ++out.unknown_entities; break;
             }
-            auto meta = resolve_entity_metadata(dwg, obj->tio.entity);
+            auto meta = resolve_entity_metadata(dwg, obj->tio.entity, block_color);
             Hatch hatch{};
             hatch.color      = meta.color;
             hatch.layer_name = std::move(meta.layer_name);
