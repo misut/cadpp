@@ -350,6 +350,8 @@ void State::load(std::string path, std::string layout) {
                 << " hatches=" << entities.hatches.size()
                 << " lines=" << entities.lines.size()
                 << " texts=" << entities.texts.size()
+                << " arrows=" << entities.arrows.size()
+                << " leaders=" << entities.leader_count
                 << " parse_ms=" << elapsed_ms(parse_start, parse_end)
                 << " bbox_ms=" << elapsed_ms(bbox_start, bbox_end)
                 << "\n";
@@ -676,6 +678,11 @@ auto canvas_painter(State const& state) {
                     state.layer_visible);
         render_paths(p, state.entities, state.transform,
                      state.layer_visible);
+        // Arrowheads sit with the line work — beneath text, above
+        // strokes — so leader callouts read as a single connected
+        // unit even when the dogleg ends inside a hatch.
+        render_arrows(p, state.entities, state.transform,
+                      state.layer_visible);
         render_texts(p, state.entities, state.transform,
                      state.layer_visible);
         auto const paint_end = PerfClock::now();

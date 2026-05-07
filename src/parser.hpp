@@ -133,6 +133,26 @@ struct Text {
     std::vector<double> tab_stops;
 };
 
+// LEADER / MULTILEADER arrowhead. The leader's polyline itself is
+// emitted as ordinary `Line` records under the same colour/layer;
+// this struct only carries the filled-triangle tip so the renderer
+// can `Painter::fill_path` it. `tip` is the world-space anchor point
+// in CAD coordinates (post-`xf.apply_point`). `dx`/`dy` is a unit
+// vector pointing from the tip *back along the leader* (so the
+// triangle's base sits on the leader's first segment, not past it).
+// `size` is the triangle's edge length in world units after the
+// parent MULTILEADER's scale factor was applied at parse time.
+// Matches AutoCAD's default "Closed Filled" arrowhead — per-block
+// custom arrowheads are deferred to a future slab.
+struct ArrowHead {
+    Point  tip;
+    double dx = 0.0;
+    double dy = 0.0;
+    double size = 0.0;
+    Color  color{};
+    std::string layer_name;
+};
+
 // CIRCLE and ARC entities, kept as native arcs so the renderer can
 // hand the framework an arc primitive instead of a chord soup.
 // `start_angle` / `end_angle` are radians, CCW per AutoCAD's
@@ -364,6 +384,7 @@ struct Entities {
     std::vector<Spline>  splines;                  // AutoCAD SPLINE entities (Slab 5)
     std::vector<SolidQuad> solid_quads;            // SOLID / TRACE fast fill quads
     std::vector<Hatch>   hatches;                  // AutoCAD HATCH entities (Slab 5)
+    std::vector<ArrowHead> arrows;                 // LEADER / MULTILEADER arrowhead tips
     std::vector<FillItem> fills;                   // HATCH + SOLID/TRACE parse order
     std::vector<Layer>   layers;                   // DWG LAYER table (Slab 4)
     std::vector<Linetype> linetypes;               // DWG LTYPE table (Slab 7)
@@ -391,6 +412,7 @@ struct Entities {
     unsigned int style_count = 0;      // Slab 8 — STYLE table entries captured
     unsigned int layout_count = 0;     // DWG LAYOUT objects captured
     unsigned int viewport_count = 0;   // Slab 9 — VIEWPORT entities expanded
+    unsigned int leader_count = 0;     // LEADER / MULTILEADER entities expanded
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.

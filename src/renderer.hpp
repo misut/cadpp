@@ -55,6 +55,18 @@ void render_fills(phenotype::Painter& p,
                   ViewportTransform const& transform,
                   LayerVisibility const& visibility);
 
+// LEADER / MULTILEADER arrowhead tips. Each `ArrowHead` is drawn as
+// a filled isoceles triangle via `Painter::fill_path` — the leader's
+// polyline body itself is already in the `lines` vector and is
+// rendered by `render_lines`. Triangle aspect mirrors AutoCAD's
+// "Closed Filled" arrowhead: a 21° half-angle (base width = 0.36 ×
+// length) — visually compact and leaves the leader's last segment
+// readable.
+void render_arrows(phenotype::Painter& p,
+                   Entities const& entities,
+                   ViewportTransform const& transform,
+                   LayerVisibility const& visibility);
+
 // HATCH boundary loops → `Painter::fill_path` (Slab 5). Each loop
 // dispatches as one fill_path call; multi-loop HATCHes (with holes)
 // overprint with the same colour — the even-odd cut-out is not

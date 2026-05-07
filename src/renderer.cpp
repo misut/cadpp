@@ -283,6 +283,48 @@ void render_lines(phenotype::Painter& p,
                          entities.lines.size(), transform);
 }
 
+void render_arrows(phenotype::Painter& p,
+                   Entities const& entities,
+                   ViewportTransform const& transform,
+                   LayerVisibility const& visibility) {
+    // Each ArrowHead carries its tip in world coords, a unit
+    // direction `(dx, dy)` pointing FROM the tip back along the
+    // leader (so `tip + dir * size` is the centre of the triangle's
+    // base), and the triangle edge length in world units. The
+    // 0.18 half-width factor matches AutoCAD's "Closed Filled"
+    // arrow style — base width = 0.36 × length, ~21° half-angle.
+    //
+    // Computing the three vertices in WORLD space and then
+    // transforming each one through `transform.apply` keeps the
+    // viewport's Y-flip self-consistent with the rest of the
+    // line geometry — a leader pointing "up" in CAD coordinates
+    // ends up with its triangle correctly opening upward on screen.
+    constexpr double kHalfWidth = 0.18;
+    for (auto const& a : entities.arrows) {
+        if (!is_visible(visibility, a.layer_name)) continue;
+        if (a.size <= 0.0) continue;
+        // Perpendicular in world frame (CCW 90°).
+        double const px = -a.dy;
+        double const py =  a.dx;
+        Point const tip{a.tip.x, a.tip.y};
+        Point const base_c{
+            tip.x + a.dx * a.size,
+            tip.y + a.dy * a.size,
+        };
+        double const half = kHalfWidth * a.size;
+        Point const base1{base_c.x + px * half, base_c.y + py * half};
+        Point const base2{base_c.x - px * half, base_c.y - py * half};
+        auto const t = transform.apply(tip.x,   tip.y);
+        auto const b1 = transform.apply(base1.x, base1.y);
+        auto const b2 = transform.apply(base2.x, base2.y);
+        phenotype::PathBuilder pb;
+        pb.move_to(static_cast<float>(t.x),  static_cast<float>(t.y));
+        pb.line_to(static_cast<float>(b1.x), static_cast<float>(b1.y));
+        pb.line_to(static_cast<float>(b2.x), static_cast<float>(b2.y));
+        p.fill_path(pb, to_paint(a.color));
+    }
+}
+
 // Resolve a per-run FontSpec, combining the entity's outer Style with
 // the run's optional overrides. Family always passes through the alias
 // table so SHX / Bitstream names resolve to host fonts.
