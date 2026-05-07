@@ -1241,6 +1241,39 @@ void expand_viewport(Dwg_Data* dwg,
                 if (!e) return false; mx = e->corner1.x; my = e->corner1.y; return true; }
             case DWG_TYPE_TRACE: { auto* e = ent->tio.TRACE;
                 if (!e) return false; mx = e->corner1.x; my = e->corner1.y; return true; }
+            // LEADER's representative point is its arrow tip (the
+            // first stored polyline vertex). MULTILEADER's first
+            // leader-node's first leader-line's first point gives
+            // the same — both anchor where the callout actually
+            // touches the geometry, so paper-space VIEWPORT bbox
+            // / circle culls drop callouts that fall outside the
+            // visible model-space rectangle. Without these, every
+            // VIEWPORT inherits every model-space leader, which is
+            // why the SECTIONS AND DETAILS render emitted ~5×
+            // duplicates of every callout.
+            case DWG_TYPE_LEADER: { auto* e = ent->tio.LEADER;
+                if (!e || e->points == nullptr || e->num_points == 0)
+                    return false;
+                mx = e->points[0].x; my = e->points[0].y; return true; }
+            case DWG_TYPE_MULTILEADER: { auto* e = ent->tio.MULTILEADER;
+                if (!e || e->ctx.num_leaders == 0
+                    || e->ctx.leaders == nullptr) return false;
+                auto const& nd = e->ctx.leaders[0];
+                if (nd.num_lines == 0 || nd.lines == nullptr) {
+                    // Fall back to the content text location when
+                    // the leader has no stroke geometry — better
+                    // than no anchor at all.
+                    if (e->ctx.has_content_txt) {
+                        mx = e->ctx.content.txt.location.x;
+                        my = e->ctx.content.txt.location.y;
+                        return true;
+                    }
+                    return false;
+                }
+                auto const& ln = nd.lines[0];
+                if (ln.points == nullptr || ln.num_points == 0)
+                    return false;
+                mx = ln.points[0].x; my = ln.points[0].y; return true; }
         }
         return false; // unknown / HATCH / other — don't cull
     };
@@ -1938,23 +1971,36 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
 
             for (BITCODE_BL i = 0; i < ml->ctx.num_leaders; ++i) {
                 Dwg_LEADER_Node const& node = ml->ctx.leaders[i];
-                // Dogleg landing segment lives at the END of each
-                // node — `lastleaderlinepoint` is the landing's
-                // far end (closest to the text), `dogleg_vector` is
-                // the unit vector from the dogleg start toward the
-                // landing, scaled by `dogleg_length`. Compute the
-                // landing endpoints once per node so each leader
-                // line can append the landing-start as its final
-                // waypoint, giving a single connected polyline from
-                // the arrow tip all the way to the text anchor.
+                // Reading libredwg's saved geometry empirically
+                // (verified against the EPDM / GYPSUM samples in
+                // architectural_-_annotation_scaling_and_multileaders.dwg):
+                //
+                //   `lastleaderlinepoint` is the END of the leader
+                //   polyline — i.e. where the polyline meets the
+                //   horizontal landing dogleg. `dogleg_vector` is the
+                //   unit direction the dogleg extends FROM
+                //   `lastleaderlinepoint` (toward the text), scaled
+                //   by `dogleg_length`. So:
+                //
+                //     polyline = [lines[j].points[0..n-1], lastleaderlinepoint]
+                //     dogleg   = [lastleaderlinepoint,
+                //                 lastleaderlinepoint + dogleg_vec * length]
+                //
+                //   The previous version had the dogleg flipped
+                //   (subtracted instead of added), which (a) put the
+                //   appended waypoint on the wrong side of
+                //   lastleaderlinepoint — skewing every multi-segment
+                //   leader's last segment angle — and (b) drew the
+                //   landing segment toward empty space instead of
+                //   toward the text.
                 bool const has_landing = node.has_dogleg
                                           && node.dogleg_length > 0.0;
-                Point const landing_end{
+                Point const dogleg_start{
                     node.lastleaderlinepoint.x,
                     node.lastleaderlinepoint.y};
-                Point const landing_start{
-                    landing_end.x - node.dogleg_vector.x * node.dogleg_length,
-                    landing_end.y - node.dogleg_vector.y * node.dogleg_length};
+                Point const dogleg_end{
+                    dogleg_start.x + node.dogleg_vector.x * node.dogleg_length,
+                    dogleg_start.y + node.dogleg_vector.y * node.dogleg_length};
                 for (BITCODE_BL j = 0; j < node.num_lines; ++j) {
                     Dwg_LEADER_Line const& ln = node.lines[j];
                     if (ln.points == nullptr || ln.num_points < 1) continue;
@@ -1975,7 +2021,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     for (BITCODE_BL k = 0; k < ln.num_points; ++k) {
                         wp.push_back({ln.points[k].x, ln.points[k].y});
                     }
-                    if (has_landing) wp.push_back(landing_start);
+                    if (has_landing) wp.push_back(dogleg_start);
                     if (wp.size() < 2) continue;  // can't draw a 1-pt path
 
                     for (std::size_t k = 0; k + 1 < wp.size(); ++k) {
@@ -2009,13 +2055,18 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                         seg_color, meta.layer_name,
                     });
                 }
-                // Emit the landing segment once per node — each line
-                // above already terminates at `landing_start`, so the
-                // landing line continues from there to the text.
+                // Emit the landing dogleg once per node — each line
+                // above already terminates at `dogleg_start` (==
+                // `lastleaderlinepoint`), so the landing continues
+                // from there in `dogleg_vector` direction toward the
+                // text. AutoCAD leaves a small gap between the
+                // dogleg end and the text edge (the "landing gap" —
+                // ctx.landing_gap), so we don't draw any line into
+                // the text bounding box itself.
                 if (has_landing) {
                     out.lines.push_back(Line{
-                        xf.apply_point(landing_start.x, landing_start.y),
-                        xf.apply_point(landing_end.x,   landing_end.y),
+                        xf.apply_point(dogleg_start.x, dogleg_start.y),
+                        xf.apply_point(dogleg_end.x,   dogleg_end.y),
                         leader_color, meta.layer_name, thickness,
                     });
                     ++out.line_count;
