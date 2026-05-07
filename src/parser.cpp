@@ -1848,21 +1848,47 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 .compose(Affine::rotate(ins->rotation))
                 .compose(Affine::scale_xy(ins->scale.x, ins->scale.y));
             Affine const child_xf = xf.compose(local);
+
+            // AutoCAD's "layer-0 inheritance" rule: entities defined
+            // inside a block on layer "0" with a BYLAYER colour adopt
+            // the parent INSERT's effective colour at instantiation
+            // time. The rule covers BOTH the block's owned geometry
+            // (lines / arcs / circles / hatches that come out of
+            // `expand_block` below) AND the per-INSERT ATTRIBs
+            // (walked separately further down — ATTDEFs become
+            // ATTRIBs whose layer field carries over from the block
+            // definition). Snapshot every entity vector size first,
+            // run the two walks, then post-patch the layer-0 ones.
+            //
+            // Without this, the architectural sample's
+            // `_DetailCallout` block (CIRCLE around the view-number,
+            // baseline LINE under the label, plus VIEWNAME ATTRIBs)
+            // resolves all four pieces to layer 0's ACI 7 = black,
+            // even though the INSERT itself sits on PS_Annot (ACI 5
+            // = blue) and the reference renders the whole callout in
+            // matching blue.
+            auto const insert_meta =
+                resolve_entity_metadata(dwg, obj->tio.entity);
+            std::size_t const lines_before     = out.lines.size();
+            std::size_t const arcs_before      = out.arcs.size();
+            std::size_t const texts_before     = out.texts.size();
+            std::size_t const bulged_before    = out.bulged_polylines.size();
+            std::size_t const ellipses_before  = out.ellipses.size();
+            std::size_t const splines_before   = out.splines.size();
+            std::size_t const solids_before    = out.solid_quads.size();
+            std::size_t const hatches_before   = out.hatches.size();
+            std::size_t const arrows_before    = out.arrows.size();
+
             expand_block(dwg, ins->block_header, child_xf, out);
-            // Walk attached ATTRIBs (attribute-value overrides for the
-            // referenced block's ATTDEFs). Each ATTRIB is its own
-            // entity object in the database — `ins->attribs` is a
-            // handle array indexed by `ins->num_owned`. We dispatch
-            // each ATTRIB through `extract_entity_xf` under the
-            // *parent* xf (NOT child_xf) because ATTRIBs are stored
-            // with paper-space-absolute coordinates, already laid out
-            // for the INSERT instance — the block-internal ATTDEFs
-            // they override carry only the symbolic prompt. View
-            // labels like "STAIR SECTION 1" / "STAIR DETAIL 2" /
-            // "STAIR SECTIONS" in the architectural sample come
-            // through this path (paper-space callout INSERTs whose
-            // ATTRIBs hold the per-instance VIEWNAME / SHEET_CONTENT
-            // values).
+
+            // Walk attached ATTRIBs (attribute-value overrides for
+            // the block's ATTDEFs). Each ATTRIB is its own entity
+            // object in the database — `ins->attribs` is a handle
+            // array sized by `ins->num_owned`. ATTRIBs are stored
+            // with paper-space-absolute coordinates already laid out
+            // for the INSERT instance, so dispatch them under the
+            // *parent* xf (NOT child_xf). View labels like "STAIR
+            // SECTION 1" / "STAIR DETAIL 2" come through here.
             if (ins->has_attribs && ins->attribs != nullptr) {
                 for (BITCODE_BL i = 0; i < ins->num_owned; ++i) {
                     BITCODE_H ah = ins->attribs[i];
@@ -1872,6 +1898,39 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                         || aobj->supertype != DWG_SUPERTYPE_ENTITY) continue;
                     extract_entity_xf(dwg, aobj, xf, out);
                 }
+            }
+
+            // Patch every newly emitted entity whose resolved layer
+            // is "0". Layer 0 inside a block definition is the
+            // AutoCAD-special inheritance layer — its content always
+            // takes the parent INSERT's effective colour at draw
+            // time, regardless of what colour `color_from_cmc` would
+            // return for layer 0's stored ACI 7 (which renders as
+            // black on cadpp's light canvas). Entities on any other
+            // layer keep their own resolved colour, including
+            // explicit ACI overrides on title-block ATTRIBs.
+            //
+            // (An earlier draft also gated on `color.a == 0` thinking
+            // unresolved colours stay alpha-zero, but ACI 7 resolves
+            // to fully-opaque black via the palette path, so the
+            // gate suppressed every legitimate inheritance.)
+            if (insert_meta.color.a != 0) {
+                auto patch = [&](auto& vec, std::size_t before) {
+                    for (std::size_t i = before; i < vec.size(); ++i) {
+                        if (vec[i].layer_name == "0") {
+                            vec[i].color = insert_meta.color;
+                        }
+                    }
+                };
+                patch(out.lines,             lines_before);
+                patch(out.arcs,              arcs_before);
+                patch(out.texts,             texts_before);
+                patch(out.bulged_polylines,  bulged_before);
+                patch(out.ellipses,          ellipses_before);
+                patch(out.splines,           splines_before);
+                patch(out.solid_quads,       solids_before);
+                patch(out.hatches,           hatches_before);
+                patch(out.arrows,            arrows_before);
             }
             ++out.insert_count;
             break;
