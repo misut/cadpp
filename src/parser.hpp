@@ -131,6 +131,16 @@ struct Text {
     // so multi-row labels share a column even when the labels
     // themselves vary in width.
     std::vector<double> tab_stops;
+    // Rotation in radians, CCW about the world +Z axis. Plain TEXT
+    // reads `t->rotation` directly; MTEXT derives it from
+    // `atan2(x_axis_dir.y, x_axis_dir.x)`. Parent INSERT / MINSERT
+    // rotation composed in via `xf.rotation()` so nested labels
+    // inherit the block instance's orientation. The renderer
+    // negates this when handing it to phenotype's `Painter::text`
+    // so the world-frame CCW convention matches phenotype's
+    // canvas-frame screen-CCW (canvas y points down — see the
+    // analogous arc handling in `render_arcs`).
+    double rotation = 0.0;
 };
 
 // LEADER / MULTILEADER arrowhead. The leader's polyline itself is

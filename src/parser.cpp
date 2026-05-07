@@ -1498,6 +1498,10 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (v_align == 3) ? TextVAlign::Top    :
                                  TextVAlign::Baseline;
             Style style = resolve_entity_style(dwg, a->style);
+            // ATTRIB stores its own rotation (radians, CCW about
+            // world +Z) — same shape as TEXT. Compose with parent
+            // INSERT/MINSERT rotation extracted from `xf`.
+            double const rotation = a->rotation + xf.rotation();
             out.texts.push_back(Text{
                 xf.apply_point(anchor.x, anchor.y),
                 a->height * xf.scale_factor(),
@@ -1506,6 +1510,10 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 std::move(meta.layer_name),
                 ha, va,
                 std::move(style),
+                /*runs=*/{},
+                /*line_spacing=*/1.0,
+                /*tab_stops=*/{},
+                rotation,
             });
             ++out.text_count;
             break;
@@ -1549,6 +1557,11 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (v_align == 3) ? TextVAlign::Top    :
                                  TextVAlign::Baseline;
             Style style = resolve_entity_style(dwg, t->style);
+            // World-frame rotation = entity's own rotation +
+            // accumulated parent INSERT/MINSERT rotation extracted
+            // from `xf`. AutoCAD stores `t->rotation` in radians,
+            // CCW about world +Z.
+            double const rotation = t->rotation + xf.rotation();
             out.texts.push_back(Text{
                 xf.apply_point(anchor.x, anchor.y),
                 t->height * xf.scale_factor(),
@@ -1557,6 +1570,10 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 std::move(meta.layer_name),
                 ha, va,
                 std::move(style),
+                /*runs=*/{},
+                /*line_spacing=*/1.0,
+                /*tab_stops=*/{},
+                rotation,
             });
             ++out.text_count;
             break;
@@ -1590,6 +1607,14 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // does for positions).
             double const scale = xf.scale_factor();
             for (auto& s : parsed.tab_stops) s *= scale;
+            // MTEXT carries its rotation as `x_axis_dir` — a 3D
+            // vector along the text's local X axis. The angle of
+            // that vector in the world XY plane (with parent
+            // INSERT/MINSERT rotation composed in via `xf`) gives
+            // the world-frame rotation we want.
+            double const rotation =
+                std::atan2(m->x_axis_dir.y, m->x_axis_dir.x)
+                + xf.rotation();
             out.texts.push_back(Text{
                 xf.apply_point(m->ins_pt.x, m->ins_pt.y),
                 m->text_height * scale,
@@ -1601,6 +1626,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 std::move(parsed.runs),
                 lsf,
                 std::move(parsed.tab_stops),
+                rotation,
             });
             ++out.text_count;
             break;
@@ -2230,9 +2256,12 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     (align == 3) ? TextHAlign::Right  :
                                    TextHAlign::Left;
                 // AutoCAD anchors MULTILEADER text at top-left of the
-                // block; pick Top vertically. PR2 will plumb the
-                // text rotation (`tx.rotation`) through.
+                // block; pick Top vertically. The leader content's
+                // own rotation (radians, CCW about world +Z) plus
+                // the parent INSERT/MINSERT's accumulated rotation
+                // — same composition rule as plain TEXT/MTEXT.
                 TextVAlign const va = TextVAlign::Top;
+                double const rotation = tx.rotation + xf.rotation();
                 out.texts.push_back(Text{
                     xf.apply_point(tx.location.x, tx.location.y),
                     text_height,
@@ -2244,10 +2273,9 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     std::move(parsed.runs),
                     lsf,
                     std::move(parsed.tab_stops),
+                    rotation,
                 });
                 ++out.text_count;
-                // TODO(PR2): once `Text::rotation` exists, set it to
-                // `tx.rotation + xf.rotation()`.
             }
             if (ml->ctx.has_content_blk
                 && ml->ctx.content.blk.block_table != nullptr) {

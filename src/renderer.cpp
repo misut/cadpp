@@ -593,6 +593,20 @@ void render_texts(phenotype::Painter& p,
             }
         }
 
+        // Canvas-frame rotation. World-frame CAD rotation is CCW
+        // about world +Z; the viewport flips world Y onto canvas
+        // Y-down, so canvas-frame rotation is the negation. The
+        // entity's `rotation` field is in CAD's world frame —
+        // negate once for the canvas, then pass that signed value
+        // through to phenotype which rotates each glyph quad
+        // around the run's pivot. Mirrors the precedent at
+        // render_arcs (line 599) where `start`/`end` swap signs to
+        // compensate for the same Y-flip.
+        float const canvas_rotation = -static_cast<float>(t.rotation);
+        bool const rotated = canvas_rotation != 0.0f;
+        float const cosR = rotated ? std::cos(canvas_rotation) : 1.0f;
+        float const sinR = rotated ? std::sin(canvas_rotation) : 0.0f;
+
         // Pass 2: emit draws. seg_measured indexed in the same visit
         // order as pass 1 so each on_segment call consumes its own
         // pre-computed measured width. Empty `piece` = TAB sentinel —
@@ -606,9 +620,25 @@ void render_texts(phenotype::Painter& p,
                 // Bottom-align segments within the line so a tall and
                 // a short run on the same line share a baseline-ish y.
                 float const seg_y = line_top_ys[li] + (line_heights[li] - font_px);
-                p.text(line_x_cursor[li], seg_y,
+                float draw_x = line_x_cursor[li];
+                float draw_y = seg_y;
+                if (rotated) {
+                    // Pre-rotate the segment's run-origin around the
+                    // entity's canvas anchor. Each segment becomes
+                    // its own rotated pivot — phenotype then rotates
+                    // glyphs around that pivot by `canvas_rotation`,
+                    // so the per-glyph offset within a run stays
+                    // axis-aligned in the rotated frame and the
+                    // multi-segment block reads as a coherent rigid
+                    // body.
+                    float const dx = draw_x - anchor_x;
+                    float const dy = draw_y - anchor_y;
+                    draw_x = anchor_x + dx * cosR - dy * sinR;
+                    draw_y = anchor_y + dx * sinR + dy * cosR;
+                }
+                p.text(draw_x, draw_y,
                        piece.data(), static_cast<unsigned int>(piece.size()),
-                       font_px, color, spec);
+                       font_px, color, spec, canvas_rotation);
             }
             line_x_cursor[li] += measured;
         });
