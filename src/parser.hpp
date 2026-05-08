@@ -86,6 +86,19 @@ struct Style {
     std::string  font_file;     // raw "arialbd.ttf" / "Arial.ttf" / etc.
     bool         bold   = false;
     bool         italic = false;
+    // STYLE table horizontal width factor (DXF 41). Multiplies each
+    // glyph's advance + visual width along the text's local X axis.
+    // 1.0 = the font's native proportions; 6.5 (e.g. ADDA in
+    // `blocks_and_tables_-_imperial.dwg`) stretches an attribute
+    // tag wide across the title-block column. The renderer feeds
+    // this into phenotype's FontSpec so the same factor applies to
+    // both glyph drawing and `measure_text` (which `render_texts`
+    // uses to anchor centred / right-aligned runs and to drive the
+    // MTEXT soft-wrap decisions). Per-entity overrides on TEXT /
+    // ATTRIB live in `Text::width_factor` and take precedence over
+    // this table value when populated; unset / non-positive entity
+    // values fall back here, which itself falls back to 1.0.
+    double       width_factor = 1.0;
 };
 
 // One inline-styled segment of an MTEXT body. Populated when
@@ -159,6 +172,15 @@ struct Text {
     // long tokens sit on their own oversized line. AutoCAD's
     // `\W<x>;` per-word-width override code is not yet honoured.
     double wrap_width = 0.0;
+    // Per-entity horizontal width factor (DXF 41 on TEXT / ATTRIB).
+    // Overrides `style.width_factor` when populated (> 0). MTEXT
+    // entities don't carry their own width_factor field — they
+    // inherit from `style.width_factor`, so this stays at 1.0 for
+    // them and the renderer falls back to the style value. Inline
+    // `\W<x>;` / `\A` MTEXT codes that mid-run scale glyphs are not
+    // yet plumbed and would land on `TextRun` (alongside the
+    // existing `height_scale`) when added.
+    double width_factor = 1.0;
     // Rotation in radians, CCW about the world +Z axis. Plain TEXT
     // reads `t->rotation` directly; MTEXT derives it from
     // `atan2(x_axis_dir.y, x_axis_dir.x)`. Parent INSERT / MINSERT

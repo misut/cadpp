@@ -348,9 +348,16 @@ void render_arrows(phenotype::Painter& p,
 
 // Resolve a per-run FontSpec, combining the entity's outer Style with
 // the run's optional overrides. Family always passes through the alias
-// table so SHX / Bitstream names resolve to host fonts.
+// table so SHX / Bitstream names resolve to host fonts. The entity-
+// level `width_factor` is propagated onto every run's FontSpec — the
+// macOS backend applies it via the Core Text font matrix so a
+// stretched ATTRIB ("ADDA" with t_wf=6.54 in
+// `blocks_and_tables_-_imperial.dwg`) renders wide along the run's
+// local X axis. MTEXT inline `\W<x>;` codes are deferred and would
+// land as a TextRun per-run override alongside `height_scale`.
 inline phenotype::FontSpec resolve_run_spec(Style const& outer,
-                                            TextRun const& r) {
+                                            TextRun const& r,
+                                            float entity_width_factor) {
     std::string_view const fam_raw = r.family_override.empty()
         ? std::string_view{outer.font_family}
         : std::string_view{r.family_override};
@@ -363,6 +370,7 @@ inline phenotype::FontSpec resolve_run_spec(Style const& outer,
         bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
         italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
         false,
+        entity_width_factor,
     };
 }
 
@@ -515,6 +523,7 @@ void render_texts(phenotype::Painter& p,
                 line_widths.push_back(0.0f);
                 line_heights.push_back(0.0f);
             }
+            float const entity_wf = static_cast<float>(t.width_factor);
             if (t.runs.empty()) {
                 std::string_view const alias =
                     alias_font_family(t.style.font_family);
@@ -525,6 +534,7 @@ void render_texts(phenotype::Painter& p,
                     t.style.bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
                     t.style.italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
                     false,
+                    entity_wf,
                 };
                 emit_run_text(t.content, outer_font_px, spec, to_paint(t.color));
             } else {
@@ -538,7 +548,8 @@ void render_texts(phenotype::Painter& p,
                         for (char c : r.text) if (c == '\n') bump_line();
                         continue;
                     }
-                    phenotype::FontSpec const spec = resolve_run_spec(t.style, r);
+                    phenotype::FontSpec const spec =
+                        resolve_run_spec(t.style, r, entity_wf);
                     Color const color = (r.color_override.a != 0)
                         ? r.color_override : t.color;
                     phenotype::Color const paint = to_paint(color);
