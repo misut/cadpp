@@ -1406,6 +1406,27 @@ void expand_viewport(Dwg_Data* dwg,
 void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                        Affine const& xf, Entities& out,
                        Color block_color) {
+    // Per-entity invisibility flag, common to every DWG entity.
+    // Open Design Specification for .dwg files: "BS : Invisible flag
+    // (bit 0: 0 = visible, 1 = invisible)" — also see
+    // `Dwg_Object_Entity::invisible` in LibreDWG's `include/dwg.h`.
+    //
+    // AutoCAD dynamic blocks bake every visibility-state copy of their
+    // geometry into one block definition and toggle this flag based on
+    // which state was active at save time; without this guard, every
+    // alternative-state copy renders on top of the active one. The
+    // architectural sample's door block uses this for its swing-angle
+    // states — five panel + arc copies share one hinge and only the
+    // active 75° pair has `invisible == 0`.
+    //
+    // The existing ATTRIB-specific check below (DWG_TYPE_ATTRIB arm)
+    // reads a different field (`Dwg_Entity_ATTRIB::flags & 0x1`) that
+    // controls attribute-display, not entity-visibility, so leave it
+    // alone.
+    if (auto const* ent = obj ? obj->tio.entity : nullptr;
+        ent != nullptr && (static_cast<unsigned>(ent->invisible) & 0x1u)) {
+        return;
+    }
     auto const fixedtype = static_cast<int>(obj->fixedtype);
     switch (fixedtype) {
         case DWG_TYPE_LINE: {
