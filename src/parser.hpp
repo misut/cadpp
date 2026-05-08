@@ -131,6 +131,22 @@ struct Text {
     // so multi-row labels share a column even when the labels
     // themselves vary in width.
     std::vector<double> tab_stops;
+    // MTEXT bounding-rectangle width (DXF 41 — the `Defined Width`
+    // the user dragged out when authoring the entity), in world
+    // units post-INSERT scale. The renderer treats this as a soft
+    // wrap boundary: when greater than zero, lines are broken at
+    // word boundaries so the visible run-width never exceeds it.
+    // Plain TEXT and MTEXT entities authored without a defined width
+    // leave this at 0, which short-circuits the wrap path back to
+    // the pre-wrap "break only on `\n`/`\t`" behaviour.
+    //
+    // Calibrated to AutoCAD's behaviour: a wider-than-rect_width
+    // word overflows the rect rather than being broken mid-word —
+    // matches Autodesk Viewer on the title-block notes in
+    // `blocks_and_tables_-_imperial.dwg` where long URLs / single
+    // long tokens sit on their own oversized line. AutoCAD's
+    // `\W<x>;` per-word-width override code is not yet honoured.
+    double wrap_width = 0.0;
     // Rotation in radians, CCW about the world +Z axis. Plain TEXT
     // reads `t->rotation` directly; MTEXT derives it from
     // `atan2(x_axis_dir.y, x_axis_dir.x)`. Parent INSERT / MINSERT

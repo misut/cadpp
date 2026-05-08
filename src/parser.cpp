@@ -1570,6 +1570,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*runs=*/{},
                 /*line_spacing=*/1.0,
                 /*tab_stops=*/{},
+                /*wrap_width=*/0.0,  // ATTRIB has no rect-width concept
                 rotation,
             });
             ++out.text_count;
@@ -1630,6 +1631,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*runs=*/{},
                 /*line_spacing=*/1.0,
                 /*tab_stops=*/{},
+                /*wrap_width=*/0.0,  // plain TEXT has no rect-width
                 rotation,
             });
             ++out.text_count;
@@ -1664,6 +1666,38 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // does for positions).
             double const scale = xf.scale_factor();
             for (auto& s : parsed.tab_stops) s *= scale;
+            // MTEXT wrap target. Two LibreDWG-exposed fields drive
+            // the choice:
+            //   - `rect_width`  (DXF 41) — the user-authored
+            //     "Defined Width" the rect was dragged out to.
+            //   - `extents_width` (DXF 42) — AutoCAD's saved
+            //     measurement of the *actual* max line width after
+            //     its native font + wrap was applied (effectively
+            //     the rendered bbox width).
+            //
+            // We pick `min(rect_width, extents_width)` as the wrap
+            // target whenever extents is positive and tighter than
+            // rect. Rationale: cadpp's fallback system font is
+            // wider than the SHX shapes (RomanS / Simplex) most
+            // architectural files reference (font metadata sticks
+            // around in the DWG but shapes themselves don't), so
+            // wrap decisions made against the raw rect_width let
+            // visibly-wider tokens slip past it. Using AutoCAD's
+            // post-wrap extents anchors cadpp's wrap to the same
+            // visual width budget that produced the saved layout —
+            // observed on `blocks_and_tables_-_imperial.dwg` where
+            // "HRWD FLOOR" / "TILE FLOOR" room subtitles wrap in
+            // Autodesk Viewer (extents=29.57 < rect=47.125) but
+            // refuse to break in cadpp under the raw rect.
+            //
+            // When extents > rect (single oversized word like
+            // "LAUNDRY" in a too-narrow rect), AutoCAD overflowed
+            // the rect and cadpp matches by emitting the word on
+            // its own oversized line — same as before.
+            double const r = m->rect_width;
+            double const e = m->extents_width;
+            double const target = (e > 0.0 && e < r) ? e : r;
+            double const wrap_width = (target > 0.0) ? target * scale : 0.0;
             // MTEXT carries its rotation as `x_axis_dir` — a 3D
             // vector along the text's local X axis. The angle of
             // that vector in the world XY plane (with parent
@@ -1683,6 +1717,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 std::move(parsed.runs),
                 lsf,
                 std::move(parsed.tab_stops),
+                wrap_width,
                 rotation,
             });
             ++out.text_count;
@@ -2306,6 +2341,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     std::move(parsed.runs),
                     lsf,
                     std::move(parsed.tab_stops),
+                    /*wrap_width=*/0.0,  // MULTILEADER text wrap not yet plumbed
                     rotation,
                 });
                 ++out.text_count;
