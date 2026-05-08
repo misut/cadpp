@@ -1746,23 +1746,42 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // marker triangle visibly missed one edge).
             bool const closed = (p->flag & 0x200) != 0;
 
-            // LWPOLYLINE constant width (DXF 43). The DXF "constwidth"
-            // bit lives at 0x4 in libredwg's encoded `flag`; the field
-            // is meaningful only when that bit is set, otherwise
-            // `const_width` is left at zero by libredwg's bit reader.
-            // We feed a positive value into the per-segment Line /
-            // BulgedPolyline `world_width` slot (after the inherited
-            // INSERT/MINSERT scale) so the renderer can stroke the
-            // edge in world units — matches AutoCAD's behaviour where
-            // a paper-space border with `const_width = 0.051"` plots
-            // as a visibly thicker ink than its neighbouring 1px
-            // lineweight edges. Per-vertex tapered widths
-            // (`flag & 0x20`, populated `widths[]`) are still flattened
-            // to a single world-width in this slab — averaging widths
-            // is a future step.
-            float const world_w =
-                ((p->flag & 0x4) && p->const_width > 0.0)
-                ? static_cast<float>(p->const_width * xf.scale_factor())
+            // LWPOLYLINE world-space stroke width. Two LibreDWG-flagged
+            // sources feed a single per-polyline scalar:
+            //   - `flag & 0x4` (CONSTWIDTH) + `const_width` (DXF 43)
+            //     — the user-typed scalar.
+            //   - `flag & 0x20` (HAS_WIDTHS) + `widths[i].{start,end}`
+            //     (DXF 40 / 41) — per-vertex widths that an AutoCAD
+            //     "rectangle" tool also writes uniformly across the
+            //     four edges. AutoCAD picks one over the other based
+            //     on how the polyline was authored; the title-block
+            //     border in `blocks_and_tables_-_imperial.dwg` mixes
+            //     the two — three sides land on `const_width` and
+            //     the fourth lives in `widths[]`, which is why the
+            //     left edge of the left rectangle stayed thin under
+            //     `feat/lwpolyline-const-width` (#38) even though
+            //     its three siblings thickened correctly.
+            //
+            // We collapse both to a single scalar by taking the max
+            // across all (segment, end) pairs — a conservative pick
+            // that keeps every visible stroke at least as bold as
+            // AutoCAD intended, at the cost of flattening tapered
+            // polylines (the segment.start != segment.end variant).
+            // Tapered support is a future pass.
+            double world_units = 0.0;
+            if ((p->flag & 0x4) && p->const_width > 0.0) {
+                world_units = p->const_width;
+            }
+            if ((p->flag & 0x20) && p->widths != nullptr) {
+                for (BITCODE_BL i = 0; i < p->num_widths; ++i) {
+                    if (p->widths[i].start > world_units)
+                        world_units = p->widths[i].start;
+                    if (p->widths[i].end > world_units)
+                        world_units = p->widths[i].end;
+                }
+            }
+            float const world_w = (world_units > 0.0)
+                ? static_cast<float>(world_units * xf.scale_factor())
                 : 0.0f;
 
             // Detect any non-zero bulge: those segments need to render
