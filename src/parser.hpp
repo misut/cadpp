@@ -37,6 +37,18 @@ struct Line {
     Color color{};
     std::string layer_name;
     float thickness = 1.0f;  // Slab 7 — pixels at canvas resolution
+    // LWPOLYLINE constant width (DXF 43, world units). 0 = no
+    // explicit width — the renderer falls back to `thickness` (the
+    // lineweight-derived screen-pixel pen). When > 0, the renderer
+    // multiplies by the active viewport scale so the stroke stays
+    // proportional to the world geometry — paper-space borders that
+    // saved a `const_width` of e.g. 0.051" render visibly thicker
+    // than ordinary lineweight-only edges in
+    // `blocks_and_tables_-_imperial.dwg`'s D-size Plot. Per-vertex
+    // tapered widths (`flag & 0x20`) are still flattened to a single
+    // world-width here — a future pass can split them into per-
+    // segment values.
+    float world_width = 0.0f;
 };
 
 // Horizontal text anchor (matches DWG TEXT::horiz_alignment, modulo
@@ -194,6 +206,10 @@ struct BulgedPolyline {
     Color               color{};
     std::string         layer_name;
     float               thickness = 1.0f;  // Slab 7
+    // See `Line::world_width`. Bulged LWPOLYLINEs share the same
+    // const_width semantics so the renderer can thicken the rounded
+    // title-block border the same way it does straight polylines.
+    float               world_width = 0.0f;
 };
 
 // AutoCAD ELLIPSE entity. `major_axis` is the vector (in CAD world

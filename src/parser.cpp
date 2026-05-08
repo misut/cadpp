@@ -736,7 +736,8 @@ void decompose_dashed_polyline(std::vector<Point> const& points,
                                Color const& color,
                                std::string const& layer_name,
                                float thickness,
-                               Entities& out) {
+                               Entities& out,
+                               float world_width = 0.0f) {
     if (points.size() < 2) return;
     double pattern_total = 0.0;
     for (double v : dashes) pattern_total += std::abs(v);
@@ -745,12 +746,12 @@ void decompose_dashed_polyline(std::vector<Point> const& points,
         for (std::size_t i = 1; i < points.size(); ++i) {
             out.lines.push_back(Line{
                 points[i - 1], points[i],
-                color, layer_name, thickness});
+                color, layer_name, thickness, world_width});
         }
         if (closed) {
             out.lines.push_back(Line{
                 points.back(), points.front(),
-                color, layer_name, thickness});
+                color, layer_name, thickness, world_width});
         }
         return;
     }
@@ -787,7 +788,7 @@ void decompose_dashed_polyline(std::vector<Point> const& points,
             if (dash_v > 0.0 && step > 1e-12) {
                 out.lines.push_back(Line{
                     cursor, next_cursor,
-                    color, layer_name, thickness});
+                    color, layer_name, thickness, world_width});
             }
             cursor = next_cursor;
             consumed += step;
@@ -1689,6 +1690,25 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             // marker triangle visibly missed one edge).
             bool const closed = (p->flag & 0x200) != 0;
 
+            // LWPOLYLINE constant width (DXF 43). The DXF "constwidth"
+            // bit lives at 0x4 in libredwg's encoded `flag`; the field
+            // is meaningful only when that bit is set, otherwise
+            // `const_width` is left at zero by libredwg's bit reader.
+            // We feed a positive value into the per-segment Line /
+            // BulgedPolyline `world_width` slot (after the inherited
+            // INSERT/MINSERT scale) so the renderer can stroke the
+            // edge in world units — matches AutoCAD's behaviour where
+            // a paper-space border with `const_width = 0.051"` plots
+            // as a visibly thicker ink than its neighbouring 1px
+            // lineweight edges. Per-vertex tapered widths
+            // (`flag & 0x20`, populated `widths[]`) are still flattened
+            // to a single world-width in this slab — averaging widths
+            // is a future step.
+            float const world_w =
+                ((p->flag & 0x4) && p->const_width > 0.0)
+                ? static_cast<float>(p->const_width * xf.scale_factor())
+                : 0.0f;
+
             // Detect any non-zero bulge: those segments need to render
             // as actual circular arcs, not straight chords. The whole
             // polyline routes through `Painter::stroke_path` so the
@@ -1720,6 +1740,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 bp.closed     = closed;
                 bp.layer_name = layer_name;
                 bp.thickness  = thickness;
+                bp.world_width = world_w;
                 bp.vertices.reserve(npts);
                 for (BITCODE_BL i = 0; i < npts; ++i) {
                     bp.vertices.push_back(
@@ -1750,20 +1771,20 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                         out.lines.push_back(Line{
                             verts[i - 1], verts[i],
                             color, layer_name,
-                            thickness,
+                            thickness, world_w,
                         });
                     }
                     if (closed) {
                         out.lines.push_back(Line{
                             verts[npts - 1], verts[0],
                             color, layer_name,
-                            thickness,
+                            thickness, world_w,
                         });
                     }
                 } else {
                     decompose_dashed_polyline(
                         verts, closed, dashes,
-                        color, layer_name, thickness, out);
+                        color, layer_name, thickness, out, world_w);
                 }
             }
             ++out.polyline_count;

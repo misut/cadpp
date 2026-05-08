@@ -262,6 +262,25 @@ private:
 
 } // namespace
 
+// Effective stroke pixel-thickness: a positive `world_width` (LWPOLYLINE
+// const_width / per-vertex width) takes precedence over the lineweight-
+// derived screen pen because it represents an authored geometric width,
+// not just a rendering hint. The world value is multiplied by the
+// canvas's world→pixel scale so the stroke fattens proportionally as
+// the user zooms in — paper-space borders saved at e.g. 0.051" stay
+// the same fraction of the sheet at every zoom level. We still floor at
+// the lineweight thickness so a misauthored zero world width wouldn't
+// silently shrink the stroke below the user's expectation.
+inline float effective_thickness(float lineweight_px,
+                                 float world_width,
+                                 ViewportTransform const& transform) {
+    if (world_width > 0.0f) {
+        float const px = world_width * static_cast<float>(transform.scale);
+        return std::max(lineweight_px, px);
+    }
+    return lineweight_px;
+}
+
 void render_lines(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform,
@@ -274,9 +293,11 @@ void render_lines(phenotype::Painter& p,
         if (!is_visible(visibility, l.layer_name)) continue;
         auto const a = transform.apply(l.a.x, l.a.y);
         auto const b = transform.apply(l.b.x, l.b.y);
+        float const stroke_px =
+            effective_thickness(l.thickness, l.world_width, transform);
         p.line(static_cast<float>(a.x), static_cast<float>(a.y),
                static_cast<float>(b.x), static_cast<float>(b.y),
-               l.thickness, to_paint(l.color));
+               stroke_px, to_paint(l.color));
     }
     process_clip_markers(p, entities.clip_markers, cursor,
                          &ClipMarker::lines_idx,
@@ -804,7 +825,9 @@ void render_paths(phenotype::Painter& p,
             }
         }
         if (bp.closed) pb.close();
-        p.stroke_path(pb, bp.thickness, to_paint(bp.color));
+        float const stroke_px =
+            effective_thickness(bp.thickness, bp.world_width, transform);
+        p.stroke_path(pb, stroke_px, to_paint(bp.color));
     }
     process_clip_markers(p, entities.clip_markers, bulged_cursor,
                          &ClipMarker::bulged_idx,
