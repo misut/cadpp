@@ -364,6 +364,14 @@ void render_texts(phenotype::Painter& p,
         // cut was hiding plenty of legible body copy on tightly-fit
         // drawings (truetype.dwg, dimension labels at zoom-out).
         if (outer_font_px < 1.5f) continue;
+        // MTEXT bounding-rectangle width in canvas px. Plain TEXT
+        // entities and unbounded MTEXT keep this at 0 so the wrap
+        // path inside `walk` short-circuits to the legacy
+        // "break only on `\n` / `\t`" behaviour and existing
+        // single-line / multi-line MTEXT regressions stay
+        // untouched.
+        float const wrap_width_px =
+            static_cast<float>(t.wrap_width * transform.scale);
 
         // Two-pass walk over the entity's content. Pass 1 measures
         // per-line widths + max heights into `line_widths` /
@@ -379,11 +387,69 @@ void render_texts(phenotype::Painter& p,
 
         auto walk = [&](auto on_segment) {
             std::size_t li = 0;
+            // Per-line running width in canvas px. Tracked locally
+            // inside walk (one fresh copy per pass call) so the
+            // soft-wrap decisions stay consistent across pass 1 and
+            // pass 2: each on_segment hook returns its measured
+            // width and walk accumulates that into running[li].
+            // Pass 1 measures fresh; pass 2 replays seg_measured
+            // recorded in pass 1 — both deterministic, so wrap
+            // points and bump_line calls match.
+            std::vector<float> running(1, 0.0f);
             auto bump_line = [&]() {
                 ++li;
                 if (li >= line_widths.size()) {
                     line_widths.resize(li + 1, 0.0f);
                     line_heights.resize(li + 1, 0.0f);
+                }
+                if (li >= running.size()) running.resize(li + 1, 0.0f);
+            };
+            // Wrap-aware emit: when `wrap_width_px > 0`, split a
+            // newline-/tab-free chunk into words greedily and call
+            // on_segment per word, inserting bump_line() at each
+            // soft break. Words that exceed the rect on their own
+            // overflow rather than breaking mid-glyph — matches
+            // AutoCAD's behaviour on long URLs / single tokens
+            // wider than the defined width.
+            auto emit_chunk = [&](std::string_view chunk, float font_px,
+                                  phenotype::FontSpec const& spec,
+                                  phenotype::Color paint) {
+                if (chunk.empty()) return;
+                if (wrap_width_px <= 0.0f) {
+                    float const m = on_segment(li, chunk, font_px, spec, paint);
+                    running[li] += m;
+                    return;
+                }
+                std::size_t i = 0;
+                while (i < chunk.size()) {
+                    // Tokenise into one word + trailing whitespace.
+                    // Trailing spaces stay attached to the preceding
+                    // word so the natural word-space-word cadence
+                    // prints intact; only inter-word boundaries can
+                    // become wrap points. UTF-8 multibyte sequences
+                    // look like opaque non-space bytes, which is
+                    // fine for the Western MTEXT this samples
+                    // covers — CJK kinsoku rules are out of scope.
+                    std::size_t const ws = i;
+                    while (i < chunk.size() && chunk[i] != ' ') ++i;
+                    std::size_t const we = i;
+                    while (i < chunk.size() && chunk[i] == ' ') ++i;
+                    std::string_view const word = chunk.substr(ws, we - ws);
+                    float const word_w = word.empty() ? 0.0f
+                        : p.measure_text(word.data(),
+                                         static_cast<unsigned int>(word.size()),
+                                         font_px, spec);
+                    // Soft-break before a word that would overshoot
+                    // the rect, unless the line is already empty
+                    // (a single oversized word emits on its own
+                    // line and still overflows — same as AutoCAD).
+                    if (running[li] > 0.0f
+                        && running[li] + word_w > wrap_width_px) {
+                        bump_line();
+                    }
+                    std::string_view const seg = chunk.substr(ws, i - ws);
+                    float const m = on_segment(li, seg, font_px, spec, paint);
+                    running[li] += m;
                 }
             };
             auto emit_run_text = [&](std::string_view text, float font_px,
@@ -402,7 +468,7 @@ void render_texts(phenotype::Painter& p,
                     std::string_view const piece =
                         (next == std::string_view::npos) ? rest : rest.substr(0, next);
                     if (!piece.empty()) {
-                        on_segment(li, piece, font_px, spec, paint);
+                        emit_chunk(piece, font_px, spec, paint);
                     }
                     if (next == std::string_view::npos) break;
                     char const brk = rest[next];
@@ -410,10 +476,14 @@ void render_texts(phenotype::Painter& p,
                         bump_line();
                     } else { // '\t'
                         // Emit a sentinel tab segment with empty text;
-                        // pass 1 records 0 measured + bumps tab counter,
-                        // pass 2 advances cursor to next tab stop.
-                        on_segment(li, std::string_view{},
-                                   font_px, spec, paint);
+                        // pass 1 records the tab advance + bumps the
+                        // tab cursor, pass 2 advances cursor to next
+                        // tab stop. on_segment returns the advance
+                        // so walk can keep `running[li]` in sync for
+                        // any post-tab wrap decision.
+                        float const m = on_segment(li, std::string_view{},
+                                                   font_px, spec, paint);
+                        running[li] += m;
                     }
                     rest = rest.substr(next + 1);
                 }
@@ -501,9 +571,12 @@ void render_texts(phenotype::Painter& p,
         // Pass 1: measure + accumulate per-line metrics. Empty `piece`
         // = TAB sentinel emitted by the splitter — advance to the
         // next defined tab stop (or default-extended grid past the
-        // last stop) instead of measuring glyphs.
+        // last stop) instead of measuring glyphs. Returns the
+        // measured width so walk can keep its per-pass `running`
+        // cursor in lockstep with `line_widths` for soft-wrap
+        // decisions inside emit_chunk.
         walk([&](std::size_t li, std::string_view piece, float font_px,
-                 phenotype::FontSpec const& spec, phenotype::Color) {
+                 phenotype::FontSpec const& spec, phenotype::Color) -> float {
             float measured;
             if (piece.empty()) {
                 measured = tab_advance(line_widths[li]);
@@ -518,6 +591,7 @@ void render_texts(phenotype::Painter& p,
             seg_measured.push_back(measured);
             line_widths[li]  += measured;
             if (font_px > line_heights[li]) line_heights[li] = font_px;
+            return measured;
         });
 
         if (line_widths.empty() || seg_measured.empty()) continue;
@@ -610,11 +684,15 @@ void render_texts(phenotype::Painter& p,
         // Pass 2: emit draws. seg_measured indexed in the same visit
         // order as pass 1 so each on_segment call consumes its own
         // pre-computed measured width. Empty `piece` = TAB sentinel —
-        // skip the draw call but still advance the cursor.
+        // skip the draw call but still advance the cursor. Returns
+        // measured so walk's `running[li]` stays consistent with
+        // pass 1 — the soft-wrap decisions inside emit_chunk re-run
+        // here and must reach the same bump_line points.
         std::vector<float> line_x_cursor = line_start_xs;
         std::size_t mi = 0;
         walk([&](std::size_t li, std::string_view piece, float font_px,
-                 phenotype::FontSpec const& spec, phenotype::Color color) {
+                 phenotype::FontSpec const& spec,
+                 phenotype::Color color) -> float {
             float const measured = seg_measured[mi++];
             if (!piece.empty()) {
                 // Bottom-align segments within the line so a tall and
@@ -641,6 +719,7 @@ void render_texts(phenotype::Painter& p,
                        font_px, color, spec, canvas_rotation);
             }
             line_x_cursor[li] += measured;
+            return measured;
         });
     }
     process_clip_markers(p, entities.clip_markers, cursor,
