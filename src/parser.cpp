@@ -701,6 +701,12 @@ Style style_from_dwg(Dwg_Data const* dwg, Dwg_Object_STYLE const* sty) {
         || (!out.bold && (contains_ci(out.font_file, "i.ttf")
                        || contains_ci(out.font_file, "i.shx")));
     out.font_family = extract_family_from_font_file(out.font_file);
+    // STYLE.width_factor (DXF 41). 0 / negative → fall back to 1.0
+    // so an unset AutoCAD style behaves as the natural font advance.
+    // Per-entity TEXT / ATTRIB `width_factor` (handled in their
+    // dispatch cases) overrides this when populated; the renderer
+    // resolves the final factor from `Text::width_factor`.
+    out.width_factor = (sty->width_factor > 0.0) ? sty->width_factor : 1.0;
     return out;
 }
 
@@ -1556,6 +1562,17 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (v_align == 3) ? TextVAlign::Top    :
                                  TextVAlign::Baseline;
             Style style = resolve_entity_style(dwg, a->style);
+            // Per-entity width_factor (DXF 41 on ATTRIB) overrides the
+            // resolved STYLE.width_factor; AutoCAD stores 0.0 to mean
+            // "use the style default", so any non-positive value falls
+            // back to the style's value, and a non-positive style value
+            // falls back to 1.0. The big stretches on cityb-faced
+            // ATTRIBs in `blocks_and_tables_-_imperial.dwg`'s title
+            // block ("ADDA" → 6.540, "CORY B." → 3.621) come through
+            // here.
+            double const wf =
+                (a->width_factor > 0.0) ? a->width_factor :
+                (style.width_factor > 0.0 ? style.width_factor : 1.0);
             // ATTRIB stores its own rotation (radians, CCW about
             // world +Z) — same shape as TEXT. Compose with parent
             // INSERT/MINSERT rotation extracted from `xf`.
@@ -1572,6 +1589,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*line_spacing=*/1.0,
                 /*tab_stops=*/{},
                 /*wrap_width=*/0.0,  // ATTRIB has no rect-width concept
+                wf,
                 rotation,
             });
             ++out.text_count;
@@ -1616,6 +1634,12 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 (v_align == 3) ? TextVAlign::Top    :
                                  TextVAlign::Baseline;
             Style style = resolve_entity_style(dwg, t->style);
+            // Per-entity width_factor (DXF 41 on TEXT) overrides the
+            // resolved STYLE.width_factor (same fallback chain as
+            // ATTRIB above).
+            double const wf =
+                (t->width_factor > 0.0) ? t->width_factor :
+                (style.width_factor > 0.0 ? style.width_factor : 1.0);
             // World-frame rotation = entity's own rotation +
             // accumulated parent INSERT/MINSERT rotation extracted
             // from `xf`. AutoCAD stores `t->rotation` in radians,
@@ -1633,6 +1657,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*line_spacing=*/1.0,
                 /*tab_stops=*/{},
                 /*wrap_width=*/0.0,  // plain TEXT has no rect-width
+                wf,
                 rotation,
             });
             ++out.text_count;
@@ -1707,6 +1732,13 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             double const rotation =
                 std::atan2(m->x_axis_dir.y, m->x_axis_dir.x)
                 + xf.rotation();
+            // MTEXT has no per-entity width_factor field — inherit
+            // from the resolved STYLE.width_factor. Inline `\W<x>;`
+            // mid-run codes are still ignored; when added they'll
+            // land on `TextRun` (alongside `height_scale`) and
+            // multiply this entity-level factor.
+            double const wf =
+                (style.width_factor > 0.0) ? style.width_factor : 1.0;
             out.texts.push_back(Text{
                 xf.apply_point(m->ins_pt.x, m->ins_pt.y),
                 m->text_height * scale,
@@ -1719,6 +1751,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 lsf,
                 std::move(parsed.tab_stops),
                 wrap_width,
+                wf,
                 rotation,
             });
             ++out.text_count;
@@ -1758,9 +1791,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             //     border in `blocks_and_tables_-_imperial.dwg` mixes
             //     the two — three sides land on `const_width` and
             //     the fourth lives in `widths[]`, which is why the
-            //     left edge of the left rectangle stayed thin under
-            //     `feat/lwpolyline-const-width` (#38) even though
-            //     its three siblings thickened correctly.
+            //     left edge of the left rectangle stayed thin in
+            //     `feat/lwpolyline-const-width` (#38).
             //
             // We collapse both to a single scalar by taking the max
             // across all (segment, end) pairs — a conservative pick
@@ -2370,6 +2402,8 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 // — same composition rule as plain TEXT/MTEXT.
                 TextVAlign const va = TextVAlign::Top;
                 double const rotation = tx.rotation + xf.rotation();
+                double const wf =
+                    (style.width_factor > 0.0) ? style.width_factor : 1.0;
                 out.texts.push_back(Text{
                     xf.apply_point(tx.location.x, tx.location.y),
                     text_height,
@@ -2382,6 +2416,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     lsf,
                     std::move(parsed.tab_stops),
                     /*wrap_width=*/0.0,  // MULTILEADER text wrap not yet plumbed
+                    wf,
                     rotation,
                 });
                 ++out.text_count;
