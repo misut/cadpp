@@ -113,9 +113,15 @@ inline void process_clip_markers(
     }
 }
 
-inline void render_hatch_item(phenotype::Painter& p,
-                              Hatch const& h,
-                              ViewportTransform const& transform) {
+// Solid (or fallback flat-colour) fill: walk every loop into a
+// `phenotype::PathBuilder` and dispatch to `Painter::fill_path`. Used
+// for `solid == true` hatches and for non-solid hatches whose
+// `pattern_lines` couldn't be resolved (LibreDWG returned an empty
+// pattern, or the hatch is a gradient — gradient ramp rendering ships
+// in a future slab).
+inline void render_hatch_solid(phenotype::Painter& p,
+                               Hatch const& h,
+                               ViewportTransform const& transform) {
     for (auto const& loop : h.loops) {
         if (loop.size() < 3) continue;
         phenotype::PathBuilder pb;
@@ -128,6 +134,146 @@ inline void render_hatch_item(phenotype::Painter& p,
                        static_cast<float>(c.y));
         }
         p.fill_path(pb, to_paint(h.color));
+    }
+}
+
+// Patterned hatch: stroke each defline into a parallel-line family,
+// clip every line against the union of boundary loops with the
+// standard odd-parity rule, and emit each inside segment as a 1px
+// `Painter::line`. Dash patterns on each defline are ignored at this
+// pass — the next slab can split each (t0, t1) inside-segment along
+// `pl.dashes` to reproduce ANSI31's dot-dash variants. Hatches with
+// no resolved pattern fall back to `render_hatch_solid` so the
+// boundary at least reads as a flat fill.
+inline void render_hatch_pattern(phenotype::Painter& p,
+                                 Hatch const& h,
+                                 ViewportTransform const& transform) {
+    if (h.pattern_lines.empty() || h.loops.empty()) return;
+
+    // Boundary bbox in CAD/world coords. Used to choose which k
+    // parallel lines actually cover the hatch.
+    double xmin = std::numeric_limits<double>::infinity();
+    double xmax = -std::numeric_limits<double>::infinity();
+    double ymin = std::numeric_limits<double>::infinity();
+    double ymax = -std::numeric_limits<double>::infinity();
+    for (auto const& loop : h.loops) {
+        for (auto const& v : loop) {
+            if (v.x < xmin) xmin = v.x;
+            if (v.x > xmax) xmax = v.x;
+            if (v.y < ymin) ymin = v.y;
+            if (v.y > ymax) ymax = v.y;
+        }
+    }
+    if (!(xmax > xmin && ymax > ymin)) return;
+
+    auto const paint = to_paint(h.color);
+
+    for (auto const& pl : h.pattern_lines) {
+        double const dx = std::cos(pl.angle);
+        double const dy = std::sin(pl.angle);
+        double const ox = pl.offset.x;
+        double const oy = pl.offset.y;
+        double const off_len2 = ox * ox + oy * oy;
+        // A zero offset would mean "all parallel lines stack on top
+        // of one another" — degenerate; skip rather than emit a
+        // single line at `pt0`. Real ANSI / ISO patterns always
+        // carry a non-zero perpendicular spacing.
+        if (off_len2 < 1e-18) continue;
+
+        // Project every bbox corner onto `offset` to find the k
+        // range that covers the hatch. `k = ((c - origin) · offset)
+        // / |offset|^2`. Pad by 1 on each side so a corner-touching
+        // line still fires.
+        double const inv_off_len2 = 1.0 / off_len2;
+        double k_min = std::numeric_limits<double>::infinity();
+        double k_max = -std::numeric_limits<double>::infinity();
+        double const corners_x[4] = {xmin, xmax, xmax, xmin};
+        double const corners_y[4] = {ymin, ymin, ymax, ymax};
+        for (int c = 0; c < 4; ++c) {
+            double const k = ((corners_x[c] - pl.origin.x) * ox
+                              + (corners_y[c] - pl.origin.y) * oy)
+                             * inv_off_len2;
+            if (k < k_min) k_min = k;
+            if (k > k_max) k_max = k;
+        }
+
+        // Pathological caps — small offset relative to bbox would
+        // otherwise spawn millions of lines. 10k caps the worst case
+        // at "ANSI31 across a 50ft border with default scale" worth
+        // of work and bails out short of OOM.
+        constexpr int kMaxLinesPerDefline = 10000;
+        int const k_lo = static_cast<int>(std::floor(k_min)) - 1;
+        int const k_hi = static_cast<int>(std::ceil(k_max)) + 1;
+        if (k_hi - k_lo > kMaxLinesPerDefline) continue;
+
+        // Reused across iterations to avoid per-k allocations.
+        std::vector<double> ts;
+        ts.reserve(16);
+
+        for (int k = k_lo; k <= k_hi; ++k) {
+            double const lx = pl.origin.x + static_cast<double>(k) * ox;
+            double const ly = pl.origin.y + static_cast<double>(k) * oy;
+
+            ts.clear();
+            for (auto const& loop : h.loops) {
+                std::size_t const n = loop.size();
+                if (n < 2) continue;
+                for (std::size_t i = 0; i < n; ++i) {
+                    auto const& a = loop[i];
+                    auto const& b = loop[(i + 1) % n];
+                    double const ex = b.x - a.x;
+                    double const ey = b.y - a.y;
+                    double const det = dy * ex - dx * ey;
+                    // Edge parallel to the line — no single-point
+                    // intersection. Skip; coincident edges are rare
+                    // enough for first-pass to ignore.
+                    if (std::abs(det) < 1e-12) continue;
+                    double const rx = a.x - lx;
+                    double const ry = a.y - ly;
+                    double const inv_det = 1.0 / det;
+                    double const u = (dx * ry - dy * rx) * inv_det;
+                    // Half-open on the upper edge to avoid double-
+                    // counting when a line passes exactly through a
+                    // shared vertex (each vertex is owned by the
+                    // edge that starts at it, not the edge that
+                    // ends there).
+                    if (u < 0.0 || u >= 1.0) continue;
+                    double const t = (ry * ex - rx * ey) * inv_det;
+                    ts.push_back(t);
+                }
+            }
+
+            if (ts.size() < 2) continue;
+            std::sort(ts.begin(), ts.end());
+
+            // Pair up via odd parity: ts[2i] is an enter, ts[2i+1]
+            // is an exit. Multi-loop hatches (outer + holes) work
+            // because the same parity rule cuts holes out: an
+            // enter-exit sandwich around a hole splits into two
+            // shorter segments.
+            for (std::size_t i = 0; i + 1 < ts.size(); i += 2) {
+                double const t0 = ts[i];
+                double const t1 = ts[i + 1];
+                if (t1 - t0 < 1e-9) continue;
+                auto const a = transform.apply(lx + dx * t0,
+                                               ly + dy * t0);
+                auto const b = transform.apply(lx + dx * t1,
+                                               ly + dy * t1);
+                p.line(static_cast<float>(a.x), static_cast<float>(a.y),
+                       static_cast<float>(b.x), static_cast<float>(b.y),
+                       1.0f, paint);
+            }
+        }
+    }
+}
+
+inline void render_hatch_item(phenotype::Painter& p,
+                              Hatch const& h,
+                              ViewportTransform const& transform) {
+    if (h.solid || h.pattern_lines.empty()) {
+        render_hatch_solid(p, h, transform);
+    } else {
+        render_hatch_pattern(p, h, transform);
     }
 }
 

@@ -303,14 +303,32 @@ struct Spline {
 // even-odd cut-out is not visible. Real holes need a multi-loop
 // fill pipeline and stay out of scope.
 //
-// `solid = true` is the only fill style rendered for now —
-// patterned and gradient HATCH entities surface as flat-colour
-// fills until pattern / gradient pipelines land.
+// Patterned HATCHes also flow `pattern_lines` — each entry is one
+// LibreDWG `defline` resolved into world space (the AutoCAD STYLE-style
+// (origin + offset + rotation) is post-multiplied by the entity's
+// `angle` and `scale_spacing` and the inherited INSERT scale, so the
+// renderer can lay parallel lines down with no further bookkeeping).
+// The renderer steps through the pattern_lines, emits a parallel-line
+// family that covers the boundary loops, and clips each line against
+// the loops with the standard odd-parity scanline rule. Solid HATCHes
+// keep `pattern_lines` empty and route through the legacy fill_path.
+//
+// Gradient HATCHes still surface as flat-colour fills — the gradient
+// stops, ramp direction, and `is_one_color` toggle don't have a
+// renderer pipeline yet.
+struct HatchPatternLine {
+    Point  origin;             // pt0 (post-rotation, post-scale, world coords)
+    Point  offset;             // step from one parallel line to the next, world coords
+    double angle = 0.0;        // line direction, radians (post-rotation)
+    std::vector<double> dashes; // raw signed dash lengths (positive=ink, negative=gap, zero=dot)
+};
+
 struct Hatch {
     std::vector<std::vector<Point>> loops;  // each loop ≥ 3 vertices, world coords
     Color                           color{};
     std::string                     layer_name;
     bool                            solid = true;
+    std::vector<HatchPatternLine>   pattern_lines;
 };
 
 // SOLID / TRACE store a single filled quadrilateral. Keep them out of
