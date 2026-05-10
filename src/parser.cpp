@@ -2488,6 +2488,38 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
             hatch.layer_name = std::move(meta.layer_name);
             hatch.solid      = h->is_solid_fill != 0;
 
+            // LibreDWG resolves the hatch's STYLE/ANGLE/SCALE into
+            // each defline's `pt0` / `offset` / `angle` already, so
+            // we only need the inherited block transform here:
+            //   - apply_point on pt0 (it's a position).
+            //   - apply_vector on offset (it's a delta).
+            //   - rotation composes onto the line direction.
+            //   - scale_factor scales the dash pattern.
+            // Solid-fill hatches keep `pattern_lines` empty so the
+            // renderer's existing fill_path branch fires unchanged.
+            // Gradient hatches still surface as flat-colour fills —
+            // the gradient ramp / direction / `is_one_color` are
+            // not yet wired into the renderer.
+            if (!hatch.solid && h->num_deflines > 0
+                && h->deflines != nullptr) {
+                hatch.pattern_lines.reserve(h->num_deflines);
+                for (BITCODE_BS i = 0; i < h->num_deflines; ++i) {
+                    auto const& dl = h->deflines[i];
+                    HatchPatternLine pl{};
+                    pl.origin = xf.apply_point(dl.pt0.x, dl.pt0.y);
+                    pl.offset = xf.apply_vector(dl.offset.x, dl.offset.y);
+                    pl.angle  = dl.angle + xf.rotation();
+                    if (dl.num_dashes > 0 && dl.dashes != nullptr) {
+                        double const s = xf.scale_factor();
+                        pl.dashes.reserve(dl.num_dashes);
+                        for (BITCODE_BS j = 0; j < dl.num_dashes; ++j) {
+                            pl.dashes.push_back(dl.dashes[j] * s);
+                        }
+                    }
+                    hatch.pattern_lines.push_back(std::move(pl));
+                }
+            }
+
             // Discretisation count for arc / bulge sweeps. 32 chords
             // is smooth at typical CAD HATCH scales (room interiors,
             // detail dashes); refining via radius-aware step is a
