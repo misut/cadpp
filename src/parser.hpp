@@ -495,6 +495,14 @@ struct Entities {
     unsigned int layout_count = 0;     // DWG LAYOUT objects captured
     unsigned int viewport_count = 0;   // Slab 9 — VIEWPORT entities expanded
     unsigned int leader_count = 0;     // LEADER / MULTILEADER entities expanded
+    // ACAD_TABLE entities the parser handled via the placeholder *T-
+    // block-walk path (the entity's `dxfname` is "ACAD_TABLE" but
+    // LibreDWG 0.13.4 returns UNKNOWN_ENT for the type-specific
+    // fields, so the table content rides through the auto-generated
+    // `*T<N>` block_header at a fixed paper-space offset). Each
+    // placeholder picks up the next slot in a horizontal fan-out so
+    // multiple tables don't overlap.
+    unsigned int acad_table_placeholder_count = 0;
 
     // unknown_entities: count of DWG_SUPERTYPE_ENTITY records that
     // the parser does not (yet) extract — surfaces what's being lost.

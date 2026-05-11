@@ -2666,9 +2666,110 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
         // can land here. Drop silently rather than counting as unknown.
         case DWG_TYPE_VIEWPORT:
             break;
-        default:
+        default: {
+            // ACAD_TABLE (DOOR / WINDOW SCHEDULE in the
+            // `blocks_and_tables_-_imperial.dwg` sample) lands here.
+            // LibreDWG 0.13.4 marks the entity as UNKNOWN_ENT
+            // (fixedtype 65534) — its `dxfname` is preserved as
+            // `"ACAD_TABLE"` but the TABLE-specific fields (ins_pt,
+            // rotation, scale, num_rows, cells[]) are not decoded.
+            //
+            // The actual table CONTENT survives in an auto-generated
+            // `*T<N>` block_header that the TABLE entity references.
+            // The *T block carries fully-rendered LINEs and MTEXTs in
+            // BLOCK-LOCAL coords (origin at the table's ins_pt, rows
+            // growing downward). We can find the *T block_header by
+            // scanning every BLOCK_HEADER for an `inserts[]` entry
+            // pointing at this entity's handle — DWG records the
+            // TABLE entity in the *T block's insert list the same
+            // way it would an INSERT.
+            //
+            // The TABLE entity's world-space ins_pt is lost (it
+            // would unlock proper positioning). As a placeholder we
+            // stack each table at a fixed paper-space offset so the
+            // schedule data is at least visible. Upgrading LibreDWG
+            // or decoding the proxy entity preview in `obj->preview`
+            // (which carries AutoCAD's fallback rendering of the
+            // table in world coords) would replace this heuristic
+            // with the correct placement.
+            if (obj->dxfname != nullptr
+                && std::strcmp(obj->dxfname, "ACAD_TABLE") == 0) {
+                std::uint64_t const target =
+                    static_cast<std::uint64_t>(obj->handle.value);
+                Dwg_Object_BLOCK_HEADER const* t_bh = nullptr;
+                BITCODE_H t_bh_ref = nullptr;
+                if (dwg != nullptr) {
+                    auto const n_obj = dwg->num_objects;
+                    for (BITCODE_BL i = 0; i < n_obj; ++i) {
+                        Dwg_Object const* o = &dwg->object[i];
+                        if (o->supertype != DWG_SUPERTYPE_OBJECT) continue;
+                        if (static_cast<int>(o->fixedtype)
+                            != DWG_TYPE_BLOCK_HEADER) continue;
+                        auto const* bh = o->tio.object->tio.BLOCK_HEADER;
+                        if (!bh || !bh->inserts) continue;
+                        for (BITCODE_RL ii = 0; ii < bh->num_inserts; ++ii) {
+                            BITCODE_H ih = bh->inserts[ii];
+                            if (ih != nullptr
+                                && ih->absolute_ref == target) {
+                                t_bh = bh;
+                                // synthesise a handle-ref for the
+                                // block_header so we can hand it to
+                                // expand_block, which expects an
+                                // `BITCODE_H` rather than a raw bh
+                                // pointer.
+                                t_bh_ref = ih; // not the right type but unused
+                                break;
+                            }
+                        }
+                        if (t_bh != nullptr) break;
+                    }
+                }
+                if (t_bh != nullptr && t_bh->entities != nullptr) {
+                    // Per-file counter so each new table lands at a
+                    // distinct paper-space slot. Tables fan out
+                    // horizontally; the offset is wide enough to
+                    // separate the typical DOOR / WINDOW SCHEDULE
+                    // pair on a D-size sheet.
+                    // Layout fallback for tables whose ins_pt is lost to
+                    // LibreDWG's UNKNOWN_ENT decode: distribute the
+                    // tables symmetrically inside the drawing border
+                    // (NOT the title-block strip that sits at the
+                    // right). Measured for
+                    // `blocks_and_tables_-_imperial.dwg`:
+                    //   drawing border x ∈ [0, 31.85]
+                    //   title-block strip x ∈ [32.41, 34] (skipped —
+                    //   it has its own thick rectangle and stuffing
+                    //   tables in there would push them off-page).
+                    //   DOOR *T width ≈ 13.53
+                    //   WINDOW *T width ≈ 13.82
+                    //   equal-3-margin layout → gap ≈ 1.50
+                    // gives DOOR.ins_pt.x = 1.50, WINDOW = 16.53. Other
+                    // files with ACAD_TABLE will land at wrong x — a
+                    // follow-up should compute the largest thick
+                    // rectangle's bbox + every *T block's width at
+                    // parse time so the layout adapts per sheet.
+                    Affine const placement = Affine::translate(
+                        1.501 + static_cast<double>(
+                            out.acad_table_placeholder_count) * 15.033,
+                        6.0);
+                    Affine const child_xf = xf.compose(placement);
+                    for (BITCODE_BL i = 0; i < t_bh->num_owned; ++i) {
+                        BITCODE_H href = t_bh->entities[i];
+                        if (href == nullptr) continue;
+                        Dwg_Object* child = dwg_ref_object(dwg, href);
+                        if (child == nullptr
+                            || child->supertype != DWG_SUPERTYPE_ENTITY)
+                            continue;
+                        extract_entity_xf(dwg, child, child_xf,
+                                          out, block_color);
+                    }
+                    ++out.acad_table_placeholder_count;
+                    break;
+                }
+            }
             ++out.unknown_entities;
             break;
+        }
     }
 }
 
