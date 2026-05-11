@@ -313,7 +313,15 @@ void State::load(std::string path, std::string layout) {
     // family resolve to the real AutoCAD face instead of the alias-
     // table substitute. Silently no-ops on misses; the alias table
     // covers the common SHX / Bitstream families either way.
+    //
+    // `register_bundled_fonts` runs first so the cad++-shipped OFL
+    // fonts (Liberation Serif, Architects Daughter, Source Sans 3,
+    // JetBrains Mono) become the floor — the alias-table substitutes
+    // for TIMES.TTF / cityb___.ttf / generic sans / mono targets
+    // resolve on a clean macOS install. Both calls are idempotent so
+    // re-entry via `FileChosen` is free.
     if (entities.ok) {
+        register_bundled_fonts();
         register_style_fonts(entities.styles);
     }
     // Snap `selected_layout` to whatever `parse_file` actually picked

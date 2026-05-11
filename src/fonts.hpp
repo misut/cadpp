@@ -48,4 +48,26 @@ struct Style;  // parser.hpp — forward-declared so this header stays
 // the alias-table substitutes — same end-user experience as before).
 unsigned int register_style_fonts(std::span<Style const> styles);
 
+// Register cad++'s shipped OFL fonts (Liberation Serif, Architects
+// Daughter, Source Sans 3, JetBrains Mono) with phenotype under their
+// canonical family names. After this call, the `kAliases` rows
+// "times" → "Liberation Serif" / "cityblueprint" → "Architects
+// Daughter" / etc. deliver guaranteed substitutes on a clean macOS
+// install — the bundled face is reachable via
+// `CTFontCreateWithName("Liberation Serif", ...)` even when no
+// system-side copy exists.
+//
+// Probes `<exec>/../../../assets/fonts` (the workspace build layout)
+// and `<exec>/assets/fonts` (a future install layout). Returns the
+// number of files successfully registered (≤ 4); returns 0 with no
+// side effects when the bundle dir cannot be located. Idempotent —
+// phenotype swallows CoreText `kCTFontManagerErrorAlreadyRegistered`
+// (105) so repeated calls from `State::load` are safe.
+//
+// macOS only for Phase B-1. Windows / Android currently return 0
+// because `executable_dir_macos` is gated behind `__APPLE__`; the
+// follow-up phases add per-platform executable-path resolution and an
+// asset-manager bridge respectively.
+unsigned int register_bundled_fonts();
+
 } // namespace cadpp
