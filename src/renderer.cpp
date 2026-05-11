@@ -1047,13 +1047,21 @@ void render_texts(phenotype::Painter& p,
                     // (rare in practice, future polish PR).
                     float const stroke_oblique_rad =
                         static_cast<float>(t.style.oblique_angle);
+                    // Stroke thickness inherits the entity's resolved
+                    // pixel-frame lineweight (layer-based for TEXT /
+                    // MTEXT / ATTRIB, since those don't carry their
+                    // own `linewt`). `apply_lineweight_policy`
+                    // collapses everything to 1 px in Model space
+                    // already, so this only fattens strokes in
+                    // paper-space layouts where the lineweight
+                    // policy is honoured.
                     hershey::draw_run(p, variant,
                                       draw_x, draw_y, stroke_cap_offset,
                                       piece,
                                       font_px,
                                       spec.width_factor,
                                       stroke_oblique_rad,
-                                      color, /*thickness=*/1.0f,
+                                      color, /*thickness=*/t.thickness,
                                       canvas_rotation);
                 } else {
                     p.text(draw_x, draw_y,

@@ -299,6 +299,7 @@ void apply_lineweight_policy(Entities& e, bool is_model) {
     for (auto& bp : e.bulged_polylines) bp.thickness = 1.0f;
     for (auto& el : e.ellipses)        el.thickness = 1.0f;
     for (auto& s : e.splines)          s.thickness  = 1.0f;
+    for (auto& t : e.texts)            t.thickness  = 1.0f;
 }
 
 void State::load(std::string path, std::string layout) {

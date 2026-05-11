@@ -199,6 +199,17 @@ struct Text {
     // canvas-frame screen-CCW (canvas y points down — see the
     // analogous arc handling in `render_arcs`).
     double rotation = 0.0;
+    // Resolved per-entity lineweight in canvas pixels. Computed by
+    // `resolve_entity_lineweight_px` at parse time — picks up the
+    // entity's own `linewt` (rare for TEXT) or falls back to the
+    // assigned LAYER's lineweight, finally defaulting to 1 px. The
+    // stroke renderer feeds this into `hershey::draw_run`'s
+    // `thickness` slot so SHX text on a thicker-than-default layer
+    // visibly fattens up. `apply_lineweight_policy` in Model space
+    // still collapses every line — including these — back to 1 px,
+    // matching Autodesk Viewer's "lineweight off" default for the
+    // model tab.
+    float thickness = 1.0f;
 };
 
 // LEADER / MULTILEADER arrowhead. The leader's polyline itself is

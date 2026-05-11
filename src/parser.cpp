@@ -1597,6 +1597,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*wrap_width=*/0.0,  // ATTRIB has no rect-width concept
                 wf,
                 rotation,
+                resolve_entity_lineweight_px(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -1665,6 +1666,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*wrap_width=*/0.0,  // plain TEXT has no rect-width
                 wf,
                 rotation,
+                resolve_entity_lineweight_px(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -1759,6 +1761,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 wrap_width,
                 wf,
                 rotation,
+                resolve_entity_lineweight_px(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -2424,6 +2427,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     /*wrap_width=*/0.0,  // MULTILEADER text wrap not yet plumbed
                     wf,
                     rotation,
+                    resolve_entity_lineweight_px(obj->tio.entity),
                 });
                 ++out.text_count;
             }
