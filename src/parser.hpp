@@ -99,6 +99,14 @@ struct Style {
     // this table value when populated; unset / non-positive entity
     // values fall back here, which itself falls back to 1.0.
     double       width_factor = 1.0;
+    // STYLE table oblique angle (DXF 50), in *radians*. Positive →
+    // the top of each glyph leans right relative to the bottom
+    // (AutoCAD's italic-by-slant convention). LibreDWG carries the
+    // raw value in degrees; the parser converts on read so the
+    // renderer can feed it straight into `std::tan`. Currently only
+    // the embedded Hershey stroke renderer honours this — phenotype's
+    // TTF backend handles slant through `FontStyle::Italic` separately.
+    double       oblique_angle = 0.0;
 };
 
 // One inline-styled segment of an MTEXT body. Populated when

@@ -400,11 +400,17 @@ void draw_run(phenotype::Painter& painter,
     // Convert a Hershey vertex (hx, hy) into local-frame canvas px.
     // `cursor_x` is the per-glyph horizontal offset accumulated as
     // we walk the run — applied to `lx` so each glyph slides right.
+    //
+    // Oblique shear: AutoCAD's STYLE.oblique_angle is positive when
+    // the TOP of the glyph leans right relative to the bottom (i.e.
+    // italic-style slant). Our `ny` is 0 at cap-top, 1 at baseline,
+    // so the top-right lean translates to a shift that's largest
+    // at `ny=0` and zero at `ny=1` — equivalent to `-ny * tan(obl)`.
     auto vertex_local = [&](int hx, int hy,
                             float cursor_x) -> std::pair<float, float> {
         float const ny = (static_cast<float>(hy) - y_top_norm) / cap;
         float const nx = static_cast<float>(hx) / cap;
-        float const lx = cursor_x + (nx * width_factor + ny * tan_obl) * font_px;
+        float const lx = cursor_x + (nx * width_factor - ny * tan_obl) * font_px;
         float const ly = ny * font_px;
         return { lx, ly };
     };
