@@ -707,6 +707,12 @@ Style style_from_dwg(Dwg_Data const* dwg, Dwg_Object_STYLE const* sty) {
     // dispatch cases) overrides this when populated; the renderer
     // resolves the final factor from `Text::width_factor`.
     out.width_factor = (sty->width_factor > 0.0) ? sty->width_factor : 1.0;
+    // STYLE.oblique_angle (DXF 50, degrees). Convert to radians for
+    // the renderer (Hershey shear consumes `tan(rad)` directly). 0
+    // is the upright default; AutoCAD clamps the field to ±85° on
+    // input, so we don't bother sanitising the range here.
+    out.oblique_angle = static_cast<double>(sty->oblique_angle)
+                      * (kPi / 180.0);
     return out;
 }
 
@@ -1591,6 +1597,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*wrap_width=*/0.0,  // ATTRIB has no rect-width concept
                 wf,
                 rotation,
+                resolve_entity_lineweight_px(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -1659,6 +1666,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 /*wrap_width=*/0.0,  // plain TEXT has no rect-width
                 wf,
                 rotation,
+                resolve_entity_lineweight_px(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -1753,6 +1761,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                 wrap_width,
                 wf,
                 rotation,
+                resolve_entity_lineweight_px(obj->tio.entity),
             });
             ++out.text_count;
             break;
@@ -2418,6 +2427,7 @@ void extract_entity_xf(Dwg_Data* dwg, Dwg_Object const* obj,
                     /*wrap_width=*/0.0,  // MULTILEADER text wrap not yet plumbed
                     wf,
                     rotation,
+                    resolve_entity_lineweight_px(obj->tio.entity),
                 });
                 ++out.text_count;
             }
