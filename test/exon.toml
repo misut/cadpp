@@ -1,0 +1,25 @@
+[package]
+# Self-tests for the cadpp library. Lives in its own subpackage so the
+# tests don't pull into the production binary (and so the Android
+# build path can stay `type = "lib"` at the repo root). Each test is a
+# small `main` that exits non-zero on failure — wired by `mise run
+# test` / `exon test` from the repo root.
+name = "cadpp-tests"
+version = "0.0.1"
+description = "cad++ self-tests"
+type = "bin"
+standard = 23
+platforms = [
+    { os = "macos", arch = "aarch64" },
+    { os = "windows", arch = "x86_64" },
+]
+
+[sync]
+cmake-in-root = false
+
+[dependencies]
+"github.com/misut/cppx" = "1.9.0"
+
+[dependencies.path]
+cadpp = ".."
+phenotype = "../../phenotype"
