@@ -6,6 +6,7 @@ import phenotype;
 
 #include "hershey.hpp"
 #include "hershey_data.hpp"
+#include "hershey_extended.hpp"
 
 namespace cadpp::hershey {
 
@@ -202,6 +203,10 @@ int glyph_index_for(char32_t cp) noexcept {
 // `detail::k_advance_factor` is the inter-glyph spacing multiplier
 // from the generated data — applied at runtime so the constant can
 // be retuned without regenerating the embedded glyph stream.
+//
+// Lookup order: space → ASCII → extended (°, ±, ⌀) → space-fallback.
+// The space fallback lets unmappable codepoints still advance the
+// cursor instead of stacking glyphs on top of each other.
 float advance_px(VariantData const& vd, char32_t cp,
                  float font_px, float width_factor) noexcept {
     float const cap   = static_cast<float>(vd.y_baseline - vd.y_top);
@@ -209,10 +214,12 @@ float advance_px(VariantData const& vd, char32_t cp,
     if (cp == 0x20)  // space
         return static_cast<float>(vd.space_advance) * scale;
     int const gi = glyph_index_for(cp);
-    if (gi < 0)
-        return static_cast<float>(vd.space_advance) * scale;
-    return static_cast<float>(vd.glyph_advance[static_cast<std::size_t>(gi)])
-        * scale;
+    if (gi >= 0)
+        return static_cast<float>(vd.glyph_advance[static_cast<std::size_t>(gi)])
+            * scale;
+    if (auto const* ext = detail::lookup_extended(cp))
+        return static_cast<float>(ext->advance) * scale;
+    return static_cast<float>(vd.space_advance) * scale;
 }
 
 } // namespace
@@ -284,20 +291,41 @@ RunBearings run_bearings(Variant v, std::string_view utf8,
     while (i < utf8.size()) {
         char32_t const cp = utf8_next(utf8, i);
         if (cp == 0) break;
-        int const gi = (cp == 0x20) ? -1 : glyph_index_for(cp);
-        if (gi < 0) {
+        if (cp == 0x20) {
             cursor_px += static_cast<float>(vd.space_advance) * adv_scale;
             continue;
         }
-        auto const idx = static_cast<std::size_t>(gi);
+        // Resolve the codepoint to its visible bearings: ASCII →
+        // per-variant glyph table; otherwise → the hand-authored
+        // extended-glyph side-car (`hershey_extended.hpp`). Anything
+        // still unresolved advances by `space_advance` and stays
+        // invisible for the bearing bookkeeping (matches the tofu
+        // policy in `advance_px` / `draw_run`).
+        int min_x_units = 0;
+        int max_x_units = 0;
+        int adv_units   = 0;
+        int const gi = glyph_index_for(cp);
+        if (gi >= 0) {
+            auto const idx = static_cast<std::size_t>(gi);
+            min_x_units = vd.glyph_min_x[idx];
+            max_x_units = vd.glyph_max_x[idx];
+            adv_units   = vd.glyph_advance[idx];
+        } else if (auto const* ext = detail::lookup_extended(cp)) {
+            min_x_units = ext->min_x;
+            max_x_units = ext->max_x;
+            adv_units   = ext->advance;
+        } else {
+            cursor_px += static_cast<float>(vd.space_advance) * adv_scale;
+            continue;
+        }
         if (!first_seen) {
             out.first_left_bearing_px =
-                static_cast<float>(vd.glyph_min_x[idx]) * x_scale;
+                static_cast<float>(min_x_units) * x_scale;
             first_seen = true;
         }
         cursor_before_last = cursor_px;
-        last_max_x_units    = vd.glyph_max_x[idx];
-        last_advance_units  = vd.glyph_advance[idx];
+        last_max_x_units    = max_x_units;
+        last_advance_units  = adv_units;
         last_seen = true;
         cursor_px += static_cast<float>(last_advance_units) * adv_scale;
     }
@@ -391,38 +419,51 @@ void draw_run(phenotype::Painter& painter,
             cursor_x += static_cast<float>(vd.space_advance) * adv_scale;
             continue;
         }
+        // Resolve the codepoint to (stroke data + advance). ASCII
+        // 0x21..0x7F goes through the per-variant table; the
+        // hand-authored side-car (`hershey_extended.hpp`) covers a
+        // small set of non-ASCII codepoints (°, ±, ⌀). Everything
+        // else falls back to a 5×5-unit tofu rectangle so the
+        // missing char is visible without overflowing the row.
+        std::int8_t const* strokes_data = nullptr;
+        std::uint16_t      strokes_count = 0;
+        std::int8_t        advance_units = vd.space_advance;
         int const gi = glyph_index_for(cp);
-        if (gi < 0) {
-            // Tofu placeholder: a tiny 5×5-Hershey-units rectangle
-            // anchored at the same baseline as a normal glyph, so
-            // missing chars are visible but don't overflow.
+        if (gi >= 0) {
+            auto const idx = static_cast<std::size_t>(gi);
+            strokes_data  = vd.strokes.data() + vd.glyph_start[idx];
+            strokes_count = vd.glyph_count[idx];
+            advance_units = vd.glyph_advance[idx];
+        } else if (auto const* ext = detail::lookup_extended(cp)) {
+            strokes_data  = ext->strokes_data;
+            strokes_count = ext->strokes_count;
+            advance_units = ext->advance;
+        } else {
             constexpr int kTofuW = 5;
             constexpr int kTofuH = 12;  // cap-region height in hershey units
-            auto const a = place(cursor_x + 0,        static_cast<float>(kTofuH - 0) * font_px / cap);
+            auto const a = place(cursor_x + 0,        static_cast<float>(kTofuH) * font_px / cap);
             auto const b = place(cursor_x + static_cast<float>(kTofuW) * font_px / cap,
-                                 static_cast<float>(kTofuH - 0) * font_px / cap);
+                                 static_cast<float>(kTofuH) * font_px / cap);
             auto const c = place(cursor_x + static_cast<float>(kTofuW) * font_px / cap, 0);
             auto const d = place(cursor_x + 0,        0);
             painter.line(a.first, a.second, b.first, b.second, thickness, color);
             painter.line(b.first, b.second, c.first, c.second, thickness, color);
             painter.line(c.first, c.second, d.first, d.second, thickness, color);
             painter.line(d.first, d.second, a.first, a.second, thickness, color);
-            cursor_x += static_cast<float>(vd.space_advance) * adv_scale;
+            cursor_x += static_cast<float>(advance_units) * adv_scale;
             continue;
         }
-
-        std::uint16_t const start = vd.glyph_start[static_cast<std::size_t>(gi)];
-        std::uint16_t const count = vd.glyph_count[static_cast<std::size_t>(gi)];
         // Walk the (x, y) byte pairs. (-128, -128) sentinel = pen-up:
         // close the current segment; the next pair after the sentinel
         // re-opens a fresh sub-path at that point. The first pair of
-        // a glyph implicitly opens a sub-path.
+        // a glyph implicitly opens a sub-path. Shared for ASCII and
+        // extended glyphs — same encoding in both data sources.
         bool  seg_open = false;
         float prev_lx  = 0.0f;
         float prev_ly  = 0.0f;
-        for (std::uint16_t k = 0; k + 1 < count; k += 2) {
-            int const sx = vd.strokes[start + k];
-            int const sy = vd.strokes[start + k + 1];
+        for (std::uint16_t k = 0; k + 1 < strokes_count; k += 2) {
+            int const sx = strokes_data[k];
+            int const sy = strokes_data[k + 1];
             if (sx == -128 && sy == -128) { seg_open = false; continue; }
             auto const [lx, ly] = vertex_local(sx, sy, cursor_x);
             if (!seg_open) {
@@ -438,8 +479,7 @@ void draw_run(phenotype::Painter& painter,
             prev_ly = ly;
         }
 
-        cursor_x += static_cast<float>(
-            vd.glyph_advance[static_cast<std::size_t>(gi)]) * adv_scale;
+        cursor_x += static_cast<float>(advance_units) * adv_scale;
     }
 }
 

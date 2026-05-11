@@ -129,6 +129,34 @@ void test_simplex_snapshot() {
     CHECK(std::abs(w - 9.0f * 1.93f / 21.0f * 100.0f) < 0.01f);
 }
 
+// 5. Hand-authored extended glyphs (°, ±, ⌀). Each codepoint should
+//    have a positive advance, a smaller advance than a typical full-
+//    cap-width glyph (so they don't push line layout), and bearings
+//    that match the hand-authored data. UTF-8 byte sequences:
+//      °  U+00B0 = 0xC2 0xB0
+//      ±  U+00B1 = 0xC2 0xB1
+//      ⌀  U+2300 = 0xE2 0x8C 0x80
+void test_extended_glyphs() {
+    using cadpp::hershey::run_bearings;
+    auto const w_deg = measure_run(Variant::kSimplex, "\xC2\xB0", 100.0f, 1.0f);
+    auto const w_pm  = measure_run(Variant::kSimplex, "\xC2\xB1", 100.0f, 1.0f);
+    auto const w_dia = measure_run(Variant::kSimplex, "\xE2\x8C\x80", 100.0f, 1.0f);
+    CHECK(w_deg > 0.0f);
+    CHECK(w_pm  > 0.0f);
+    CHECK(w_dia > 0.0f);
+
+    // Snapshot the degree-sign advance against hand-authored data
+    // (advance=9 raw, same scaling math as ASCII).
+    CHECK(std::abs(w_deg - 9.0f * 1.93f / 21.0f * 100.0f) < 0.01f);
+    // Diameter advance = 18 raw (close to capital 'O').
+    CHECK(std::abs(w_dia - 18.0f * 1.93f / 21.0f * 100.0f) < 0.01f);
+
+    // Bearings are populated for extended glyphs too (matches the
+    // hand-authored min_x / max_x in `hershey_extended.hpp`).
+    auto const b_deg = run_bearings(Variant::kSimplex, "\xC2\xB0", 100.0f, 1.0f);
+    CHECK(std::abs(b_deg.first_left_bearing_px - 1.0f / 21.0f * 100.0f) < 0.01f);
+}
+
 } // namespace
 
 int main() {
@@ -136,6 +164,7 @@ int main() {
     test_resolve_variant();
     test_measure_run();
     test_simplex_snapshot();
+    test_extended_glyphs();
     if (g_failed == 0) {
         std::cout << "PASS hershey_test (all)\n";
         return 0;
