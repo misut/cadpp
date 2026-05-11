@@ -56,3 +56,19 @@ cad++ inherits GPLv3 from its dependency on LibreDWG (also GPLv3+).
 The `phenotype` UI framework, the `exon` build system, and other
 upstream libraries (`cppx`, `txn`, `jsoncpp`) remain MIT and are
 linked into cad++ under their respective licenses.
+
+## Bundled fonts
+
+cad++ ships four SIL OFL 1.1 fonts under [`assets/fonts/`](assets/fonts)
+so AutoCAD-shipped typefaces (`TIMES.TTF`, CityBlueprint, …) render on
+hosts that don't have them installed:
+
+- **Liberation Serif** — Times Roman substitute. © 2010 Google Corporation;
+  © 2012 Red Hat, Inc.
+- **Architects Daughter** — CityBlueprint substitute. © 2010 Kimberly Geswein.
+- **Source Sans 3** — sans-serif fallback. © 2010-2022 Adobe.
+- **JetBrains Mono** — monospace fallback. © 2020 JetBrains Mono Project Authors.
+
+Full OFL 1.1 text, per-font copyright headers, and reproduction commands
+live in [`assets/fonts/LICENSE.txt`](assets/fonts/LICENSE.txt) and
+[`assets/fonts/README.md`](assets/fonts/README.md).

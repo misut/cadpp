@@ -86,6 +86,24 @@ constexpr std::pair<std::string_view, std::string_view> kAliases[] = {
     {"univmath",         "STIXGeneral"},
     {"stylus",           "Marker Felt"},
     {"stylu",            "Marker Felt"},
+    // Bundled SIL OFL fonts (see `assets/fonts/` and
+    // `register_bundled_fonts`). Each row pairs an AutoCAD family token
+    // with the canonical name of one of the four bundled faces. The
+    // pairing only delivers a real substitute because
+    // `register_bundled_fonts` registers each family name with phenotype
+    // up-front; without that registration the lookup falls through to
+    // the host's CTFontCreateWithName which finds nothing on a clean
+    // install. Longer substrings go first so "timesnewroman" wins
+    // before "times" is even tried.
+    {"timesnewroman",    "Liberation Serif"},
+    {"timesroman",       "Liberation Serif"},
+    {"times",            "Liberation Serif"},
+    {"cityblueprint",    "Architects Daughter"},
+    {"cityb",            "Architects Daughter"},
+    {"arial",            "Source Sans 3"},
+    {"helvetica",        "Source Sans 3"},
+    {"courier",          "JetBrains Mono"},
+    {"consolas",         "JetBrains Mono"},
     // AutoCAD-shipped SHX shape fonts. The parser may pass the raw
     // basename ("txt") OR a fully qualified name ("txt.shx") through
     // `\f` switches; canonicalise() normalises both to "txtshx" /
@@ -115,9 +133,73 @@ std::string_view alias_font_family(std::string_view dwg_family) noexcept {
 
 namespace {
 
+// Forward-declare the Darwin-only symbol so we don't drag
+// `<mach-o/dyld.h>` through an `import std;` translation unit. Only
+// reached from `executable_dir_macos`, which is itself behind
+// `__APPLE__`, so no link impact on Windows / Android builds.
+#ifdef __APPLE__
+extern "C" int _NSGetExecutablePath(char* buf, std::uint32_t* size);
+#endif
+
+// Directory containing the running binary on Apple; empty elsewhere.
+// `_NSGetExecutablePath` may return a path with embedded `..` /
+// symlinks (typical for `.exon/{debug,release}/cadpp-native` layouts
+// produced by exon), so canonicalise before stripping the final
+// component. Falls back to the raw path if `canonical` fails (e.g.
+// dangling symlink).
+std::filesystem::path executable_dir_macos() {
+#ifdef __APPLE__
+    char buf[4096];
+    std::uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) != 0) return {};
+    std::error_code ec;
+    auto p = std::filesystem::canonical(buf, ec);
+    if (ec) p = std::filesystem::path{buf};
+    return p.parent_path();
+#else
+    return {};
+#endif
+}
+
+// Resolve cad++'s bundled `assets/fonts/` directory. Probes two
+// layouts in order:
+//
+//   1. `<exec>/../../../assets/fonts` — workspace build, where the
+//      binary sits at `native/.exon/{debug,release}/cadpp-native` and
+//      the bundle lives at the repo root.
+//   2. `<exec>/assets/fonts` — future install layout where the bundle
+//      ships next to the binary (e.g. `/usr/local/bin/cadpp-native`
+//      with assets in `/usr/local/bin/assets/fonts`).
+//
+// Returns empty when neither directory exists; the bundle features
+// then quietly no-op.
+std::filesystem::path locate_bundled_fonts_dir() {
+    namespace fs = std::filesystem;
+    auto const exec = executable_dir_macos();
+    if (exec.empty()) return {};
+    std::error_code ec;
+    auto const repo = exec / ".." / ".." / ".." / "assets" / "fonts";
+    if (fs::is_directory(repo, ec)) {
+        auto const canon = fs::canonical(repo, ec);
+        if (!ec) return canon;
+    }
+    auto const adj = exec / "assets" / "fonts";
+    if (fs::is_directory(adj, ec)) {
+        auto const canon = fs::canonical(adj, ec);
+        if (!ec) return canon;
+    }
+    return {};
+}
+
 // Push standard macOS font search directories onto `out`. Order
 // matters — the env-var override comes first so users can shadow
-// system fonts with their own copy of an AutoCAD face.
+// system fonts with their own copy of an AutoCAD face. The bundled
+// `assets/fonts/` slot follows so a user can drop a replacement .ttf
+// (matching a STYLE entry's basename, e.g. their own `TIMES.TTF`) into
+// the bundle and have it win over `/Library/Fonts`. The bundle's own
+// `LiberationSerif-Regular.ttf` etc. don't share basenames with any
+// AutoCAD-shipped STYLE entry — they're surfaced through
+// `register_bundled_fonts` instead.
 void collect_search_dirs(std::vector<std::string>& out) {
     if (char const* env = std::getenv("CADPP_FONT_DIR"); env != nullptr) {
         std::string_view rest{env};
@@ -128,6 +210,9 @@ void collect_search_dirs(std::vector<std::string>& out) {
             if (sep == std::string_view::npos) break;
             rest = rest.substr(sep + 1);
         }
+    }
+    if (auto const bundled = locate_bundled_fonts_dir(); !bundled.empty()) {
+        out.emplace_back(bundled.string());
     }
     if (char const* home = std::getenv("HOME"); home != nullptr) {
         out.emplace_back(std::string{home} + "/Library/Fonts");
@@ -236,6 +321,42 @@ unsigned int register_style_fonts(std::span<Style const> styles) {
         // those at render time.
         if (ends_with_ci(path, ".shx")) continue;
         if (phenotype::native::text::register_font_file(s.font_family, path)) {
+            ++registered;
+        }
+    }
+    return registered;
+}
+
+namespace {
+
+// Each pair is the canonical upstream family name and the bundled
+// basename `register_bundled_fonts` looks for under
+// `assets/fonts/`. Family names match the right-hand side of the
+// bundled-OFL rows in `kAliases` so an alias-table hit
+// (e.g. "times" → "Liberation Serif") resolves through phenotype's
+// `registered_aliases` to the bundled face.
+struct BundledFont {
+    std::string_view alias;
+    std::string_view basename;
+};
+constexpr BundledFont kBundled[] = {
+    {"Liberation Serif",    "LiberationSerif-Regular.ttf"},
+    {"Architects Daughter", "ArchitectsDaughter-Regular.ttf"},
+    {"Source Sans 3",       "SourceSans3-Regular.ttf"},
+    {"JetBrains Mono",      "JetBrainsMono-Regular.ttf"},
+};
+
+} // namespace
+
+unsigned int register_bundled_fonts() {
+    auto const dir = locate_bundled_fonts_dir();
+    if (dir.empty()) return 0;
+    unsigned int registered = 0;
+    for (auto const& f : kBundled) {
+        auto const path = (dir / f.basename).string();
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) continue;
+        if (phenotype::native::text::register_font_file(f.alias, path)) {
             ++registered;
         }
     }
