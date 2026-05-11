@@ -9,6 +9,7 @@
 
 #include "renderer.hpp"
 #include "fonts.hpp"
+#include "hershey.hpp"
 
 namespace cadpp {
 
@@ -559,6 +560,22 @@ void render_texts(phenotype::Painter& p,
         std::vector<float> line_widths;
         std::vector<float> line_heights;
         std::vector<float> seg_measured;  // one entry per visible segment
+        // Per-line side bearings for h-align correction. Hershey's
+        // kerning advance `o` often differs from each glyph's visible
+        // extent (e.g. `D` advances 11 but visibly ends at max_x=18,
+        // sitting inside the kerning), so `line_widths/2` alone
+        // shifts visible centres off the anchor for some letter
+        // pairs (HRWD's `D` was leftward of HALL's `L` in the room
+        // labels). `line_first_left_bearing[li]` is the very first
+        // visible glyph's `min_x`; `line_last_right_overflow[li]` is
+        // the most-recent stroke segment's last visible glyph's
+        // `max_x − advance` (negative when the visible right edge
+        // sits inside the kerning). TTF / empty segments leave these
+        // alone — TTF runs through `Painter::measure_text` already
+        // returns a near-visible width.
+        std::vector<float> line_first_left_bearing;
+        std::vector<float> line_last_right_overflow;
+        std::vector<bool>  line_first_seen;
 
         auto walk = [&](auto on_segment) {
             std::size_t li = 0;
@@ -576,6 +593,9 @@ void render_texts(phenotype::Painter& p,
                 if (li >= line_widths.size()) {
                     line_widths.resize(li + 1, 0.0f);
                     line_heights.resize(li + 1, 0.0f);
+                    line_first_left_bearing.resize(li + 1, 0.0f);
+                    line_last_right_overflow.resize(li + 1, 0.0f);
+                    line_first_seen.resize(li + 1, false);
                 }
                 if (li >= running.size()) running.resize(li + 1, 0.0f);
             };
@@ -588,10 +608,12 @@ void render_texts(phenotype::Painter& p,
             // wider than the defined width.
             auto emit_chunk = [&](std::string_view chunk, float font_px,
                                   phenotype::FontSpec const& spec,
-                                  phenotype::Color paint) {
+                                  phenotype::Color paint,
+                                  hershey::Variant variant) {
                 if (chunk.empty()) return;
                 if (wrap_width_px <= 0.0f) {
-                    float const m = on_segment(li, chunk, font_px, spec, paint);
+                    float const m = on_segment(li, chunk, font_px, spec,
+                                               paint, variant);
                     running[li] += m;
                     return;
                 }
@@ -610,10 +632,17 @@ void render_texts(phenotype::Painter& p,
                     std::size_t const we = i;
                     while (i < chunk.size() && chunk[i] == ' ') ++i;
                     std::string_view const word = chunk.substr(ws, we - ws);
+                    // Stroke runs measure their own width — wrap
+                    // points stay aligned with what `draw_run` will
+                    // emit instead of asking the system Helvetica.
                     float const word_w = word.empty() ? 0.0f
-                        : p.measure_text(word.data(),
-                                         static_cast<unsigned int>(word.size()),
-                                         font_px, spec);
+                        : (variant != hershey::Variant::kNone
+                            ? hershey::measure_run(variant, word, font_px,
+                                                   spec.width_factor)
+                            : p.measure_text(
+                                word.data(),
+                                static_cast<unsigned int>(word.size()),
+                                font_px, spec));
                     // Soft-break before a word that would overshoot
                     // the rect, unless the line is already empty
                     // (a single oversized word emits on its own
@@ -623,13 +652,15 @@ void render_texts(phenotype::Painter& p,
                         bump_line();
                     }
                     std::string_view const seg = chunk.substr(ws, i - ws);
-                    float const m = on_segment(li, seg, font_px, spec, paint);
+                    float const m = on_segment(li, seg, font_px, spec,
+                                               paint, variant);
                     running[li] += m;
                 }
             };
             auto emit_run_text = [&](std::string_view text, float font_px,
                                      phenotype::FontSpec const& spec,
-                                     phenotype::Color paint) {
+                                     phenotype::Color paint,
+                                     hershey::Variant variant) {
                 std::string_view rest = text;
                 while (!rest.empty()) {
                     // Find the next break (newline or tab) — splitting
@@ -643,7 +674,7 @@ void render_texts(phenotype::Painter& p,
                     std::string_view const piece =
                         (next == std::string_view::npos) ? rest : rest.substr(0, next);
                     if (!piece.empty()) {
-                        emit_chunk(piece, font_px, spec, paint);
+                        emit_chunk(piece, font_px, spec, paint, variant);
                     }
                     if (next == std::string_view::npos) break;
                     char const brk = rest[next];
@@ -657,7 +688,8 @@ void render_texts(phenotype::Painter& p,
                         // so walk can keep `running[li]` in sync for
                         // any post-tab wrap decision.
                         float const m = on_segment(li, std::string_view{},
-                                                   font_px, spec, paint);
+                                                   font_px, spec, paint,
+                                                   variant);
                         running[li] += m;
                     }
                     rest = rest.substr(next + 1);
@@ -668,13 +700,24 @@ void render_texts(phenotype::Painter& p,
             if (line_widths.empty()) {
                 line_widths.push_back(0.0f);
                 line_heights.push_back(0.0f);
+                line_first_left_bearing.push_back(0.0f);
+                line_last_right_overflow.push_back(0.0f);
+                line_first_seen.push_back(false);
             }
             float const entity_wf = static_cast<float>(t.width_factor);
+            // Variant decision lives next to the FontSpec build so
+            // both passes see the same value. `t.style.font_file`
+            // is the only `font_file` cadpp carries; MTEXT `\f`
+            // overrides ride on `r.family_override` (family only,
+            // no file), and the family token is what
+            // `resolve_variant`'s SHX-family table inspects.
             if (t.runs.empty()) {
                 std::string_view const alias =
                     alias_font_family(t.style.font_family);
                 std::string_view const family =
                     alias.empty() ? std::string_view{t.style.font_family} : alias;
+                hershey::Variant const variant = hershey::resolve_variant(
+                    t.style.font_family, t.style.font_file);
                 phenotype::FontSpec const spec{
                     family,
                     t.style.bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
@@ -682,7 +725,8 @@ void render_texts(phenotype::Painter& p,
                     false,
                     entity_wf,
                 };
-                emit_run_text(t.content, outer_font_px, spec, to_paint(t.color));
+                emit_run_text(t.content, outer_font_px, spec,
+                              to_paint(t.color), variant);
             } else {
                 for (auto const& r : t.runs) {
                     float const run_font_px = static_cast<float>(
@@ -696,10 +740,20 @@ void render_texts(phenotype::Painter& p,
                     }
                     phenotype::FontSpec const spec =
                         resolve_run_spec(t.style, r, entity_wf);
+                    // Inline `\f<face>;` overrides feed a family but
+                    // no font_file — defer to the entity STYLE's
+                    // font_file for the SHX gate. When the override
+                    // is empty we use the entity family directly.
+                    std::string_view const fam_for_variant =
+                        r.family_override.empty()
+                            ? std::string_view{t.style.font_family}
+                            : std::string_view{r.family_override};
+                    hershey::Variant const variant = hershey::resolve_variant(
+                        fam_for_variant, t.style.font_file);
                     Color const color = (r.color_override.a != 0)
                         ? r.color_override : t.color;
                     phenotype::Color const paint = to_paint(color);
-                    emit_run_text(r.text, run_font_px, spec, paint);
+                    emit_run_text(r.text, run_font_px, spec, paint, variant);
                 }
             }
         };
@@ -754,10 +808,17 @@ void render_texts(phenotype::Painter& p,
         // cursor in lockstep with `line_widths` for soft-wrap
         // decisions inside emit_chunk.
         walk([&](std::size_t li, std::string_view piece, float font_px,
-                 phenotype::FontSpec const& spec, phenotype::Color) -> float {
+                 phenotype::FontSpec const& spec, phenotype::Color,
+                 hershey::Variant variant) -> float {
             float measured;
             if (piece.empty()) {
                 measured = tab_advance(line_widths[li]);
+            } else if (variant != hershey::Variant::kNone) {
+                // Stroke runs measure with the same advance table
+                // `draw_run` uses below — keeps pass 1 and pass 2 in
+                // exact agreement so soft-wrap / h-align stay tight.
+                measured = hershey::measure_run(variant, piece, font_px,
+                                                spec.width_factor);
             } else {
                 measured = p.measure_text(
                     piece.data(), static_cast<unsigned int>(piece.size()),
@@ -769,6 +830,32 @@ void render_texts(phenotype::Painter& p,
             seg_measured.push_back(measured);
             line_widths[li]  += measured;
             if (font_px > line_heights[li]) line_heights[li] = font_px;
+            // Update per-line stroke bearings for h-align Center/
+            // Middle (see `line_first_left_bearing` declaration).
+            // Only stroke segments contribute; tab sentinels and
+            // TTF segments leave the per-line state alone, which is
+            // what we want — TTF measures are already close to the
+            // visible width, and tab sentinels have no glyphs.
+            if (!piece.empty() && variant != hershey::Variant::kNone) {
+                auto const b = hershey::run_bearings(variant, piece,
+                                                    font_px,
+                                                    spec.width_factor);
+                if (!line_first_seen[li]) {
+                    line_first_left_bearing[li] = b.first_left_bearing_px;
+                    line_first_seen[li] = true;
+                }
+                // Last-segment overflow is overwritten by each new
+                // stroke segment so the final value reflects the
+                // line's right-most visible glyph.
+                line_last_right_overflow[li] = b.last_right_overflow_px;
+            } else if (!piece.empty() && !line_first_seen[li]) {
+                // First segment of the line is TTF (or anything non-
+                // stroke) — leave bearings at 0 but mark "first seen"
+                // so a later stroke segment doesn't overwrite the
+                // left-bearing entry (which would shift the line's
+                // visible anchor based on the wrong glyph).
+                line_first_seen[li] = true;
+            }
             return measured;
         });
 
@@ -786,8 +873,32 @@ void render_texts(phenotype::Painter& p,
         // that the same DWG draws across each font row. Plain TEXT
         // (runs empty, single line) reduces to font_px since the loop
         // below max()es against the per-line height.
+        //
+        // Stroke-style entities (STYLE.font_file ends in .shx) need
+        // a slightly bumped multiplier: the glyphs draw with a larger
+        // visible cap height than phenotype's TTF rasterisation
+        // (cap == font_px vs. ~0.7×font_px for Helvetica) and they
+        // emit descenders (g/y/p/q/j) into the row below their
+        // baseline. The hand-off-tuned value below keeps the stroke
+        // MTEXT rows readable without pushing them apart visibly
+        // compared to Autodesk Viewer's SHX rendering (which uses
+        // tighter leading than phenotype's TTF calibration).
+        //
+        // Note: `total_height` (sum of line_advances) scales with
+        // this multiplier and drives the v_align Middle math. The
+        // stroke `cap_offset` we pass to `hershey::draw_run` below
+        // is locked to `(multiplier − 1) / 2 × font_px` so the
+        // visible centre of a Middle-aligned single-line run stays
+        // exactly on the anchor for any multiplier we pick — that
+        // way line-spacing retuning doesn't drag hexagon callout
+        // numbers off-centre.
+        bool  const entity_is_stroke =
+            hershey::is_shx_font_file(t.style.font_file);
+        float const line_advance_multiplier =
+            entity_is_stroke ? 1.55f : 1.25f;
         float const default_advance =
-            outer_font_px * 1.25f * static_cast<float>(t.line_spacing);
+            outer_font_px * line_advance_multiplier
+            * static_cast<float>(t.line_spacing);
         std::vector<float> line_advances(line_heights.size(), 0.0f);
         for (std::size_t li = 0; li < line_heights.size(); ++li) {
             // Most rows use the entity-wide advance. If a single run on
@@ -834,12 +945,28 @@ void render_texts(phenotype::Painter& p,
             for (std::size_t li = 0; li < line_widths.size(); ++li) {
                 line_top_ys[li] = cumulative;
                 cumulative += line_advances[li];
+                // Stroke runs need a small h-align correction so the
+                // *visible* bounding box lands on the anchor — the
+                // kerning-advance sum (`line_widths`) drifts off-
+                // centre for letters whose visible right sits inside
+                // their kerning width (e.g. `D`'s `max_x=18` vs.
+                // `advance≈21`, which shifts the visible centre of
+                // `HRWD` slightly left of `HALL`). The renderer of
+                // measure_run + run_bearings populated these per-line
+                // bookkeeping fields in pass 1; here we collapse
+                // them into the line's start cursor.
+                float const visible_center_adj =
+                    (line_first_left_bearing[li]
+                     + line_last_right_overflow[li]) * 0.5f;
                 float lx = anchor_x;
                 switch (t.h_align) {
                 case TextHAlign::Left:                                  break;
-                case TextHAlign::Center: lx -= line_widths[li] * 0.5f;  break;
-                case TextHAlign::Middle: lx -= line_widths[li] * 0.5f;  break;
-                case TextHAlign::Right:  lx -= line_widths[li];         break;
+                case TextHAlign::Center:
+                    lx -= line_widths[li] * 0.5f + visible_center_adj; break;
+                case TextHAlign::Middle:
+                    lx -= line_widths[li] * 0.5f + visible_center_adj; break;
+                case TextHAlign::Right:
+                    lx -= line_widths[li] + line_last_right_overflow[li]; break;
                 }
                 line_start_xs[li] = lx;
             }
@@ -870,7 +997,8 @@ void render_texts(phenotype::Painter& p,
         std::size_t mi = 0;
         walk([&](std::size_t li, std::string_view piece, float font_px,
                  phenotype::FontSpec const& spec,
-                 phenotype::Color color) -> float {
+                 phenotype::Color color,
+                 hershey::Variant variant) -> float {
             float const measured = seg_measured[mi++];
             if (!piece.empty()) {
                 // Bottom-align segments within the line so a tall and
@@ -881,20 +1009,50 @@ void render_texts(phenotype::Painter& p,
                 if (rotated) {
                     // Pre-rotate the segment's run-origin around the
                     // entity's canvas anchor. Each segment becomes
-                    // its own rotated pivot — phenotype then rotates
-                    // glyphs around that pivot by `canvas_rotation`,
-                    // so the per-glyph offset within a run stays
-                    // axis-aligned in the rotated frame and the
-                    // multi-segment block reads as a coherent rigid
-                    // body.
+                    // its own rotated pivot — phenotype (or the
+                    // stroke renderer) then rotates the glyph stream
+                    // around that pivot by `canvas_rotation`, so the
+                    // per-glyph offset within a run stays axis-
+                    // aligned in the rotated frame and the multi-
+                    // segment block reads as a coherent rigid body.
                     float const dx = draw_x - anchor_x;
                     float const dy = draw_y - anchor_y;
                     draw_x = anchor_x + dx * cosR - dy * sinR;
                     draw_y = anchor_y + dx * sinR + dy * cosR;
                 }
-                p.text(draw_x, draw_y,
-                       piece.data(), static_cast<unsigned int>(piece.size()),
-                       font_px, color, spec, canvas_rotation);
+                if (variant != hershey::Variant::kNone) {
+                    // Stroke text reuses the surrounding clip /
+                    // viewport state and emits `Painter::line` calls
+                    // under the same canvas frame as the TTF path.
+                    // Thickness is held at a 1 px hairline — AutoCAD
+                    // SHX rendering is conventionally drawn that way
+                    // regardless of the layer's lineweight.
+                    //
+                    // `cap_offset_y` is the gap from `draw_y` (the
+                    // segment's "font-box top" in this renderer's
+                    // vocabulary) to the glyph's cap-top. Locked to
+                    // `(line_advance_multiplier − 1) / 2 × font_px`
+                    // so the v_align Middle visible centre of a
+                    // single-line run lands exactly on the entity
+                    // anchor (block math: total_height − font_px →
+                    // halved → that's the cap-top offset that puts
+                    // visual_center back at `anchor_y`).
+                    float const stroke_cap_offset =
+                        font_px * (line_advance_multiplier - 1.0f) * 0.5f;
+                    hershey::draw_run(p, variant,
+                                      draw_x, draw_y, stroke_cap_offset,
+                                      piece,
+                                      font_px,
+                                      spec.width_factor,
+                                      /*oblique_rad=*/0.0f,
+                                      color, /*thickness=*/1.0f,
+                                      canvas_rotation);
+                } else {
+                    p.text(draw_x, draw_y,
+                           piece.data(),
+                           static_cast<unsigned int>(piece.size()),
+                           font_px, color, spec, canvas_rotation);
+                }
             }
             line_x_cursor[li] += measured;
             return measured;
