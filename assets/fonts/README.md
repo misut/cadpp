@@ -49,3 +49,33 @@ weights only if synthesis looks visually off on a real DWG.
 Do not modify the bundled `.ttf` files in place — when bumping a font,
 replace the file with the upstream release verbatim and update the
 version row in the table above.
+
+## Host font discovery (since issue #48 follow-up)
+
+The renderer probes phenotype's `Painter::font_metrics` for the DWG's
+raw `STYLE.font_family` first, and only falls back to the alias-table
+substitute (the four bundled OFL faces above) when the host can't
+resolve the original. This matches AutoCAD's font-discovery model: if
+the file ships with the requested font installed, use it; otherwise
+substitute.
+
+For AutoCAD-faithful rendering of fonts cad++ can't legally bundle —
+notably **City Blueprint** (`cityb___.ttf`, copyrighted by Payne
+Loving Trust, distributed by Linguist's Software, bundled with
+Microsoft Office) — install the original TTF on the host:
+
+- **macOS**: drop the `.ttf` into `~/Library/Fonts/` (no relogin
+  needed — CoreText picks it up immediately).
+- **Windows**: install via *Settings → Personalization → Fonts*, or
+  rely on Microsoft Office's bundled copy.
+- **Linux**: drop into `~/.local/share/fonts/` and run `fc-cache -f`.
+
+cad++ will then render the DWG with the actual font (e.g. ADDA /
+CORY B. / BOB M. ATTRIBs in `blocks_and_tables_-_imperial.dwg` fit
+their narrow rotated cells because City Blueprint's narrow strokes
+absorb the `width_factor=6.5` stretch).
+
+Set `CADPP_FONT_FORCE_ALIAS=1` to short-circuit the host probe and
+pin every aliased family to its bundled OFL substitute regardless of
+what's installed — useful for pixel-stable regression testing or when
+you specifically want the bundled aesthetic.
