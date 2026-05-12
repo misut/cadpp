@@ -929,10 +929,58 @@ void render_texts(phenotype::Painter& p,
         // baselines line up with separator-LINE y values when the
         // body is shifted down by half the outer text height.
         float const cap_offset = outer_font_px * 0.5f;
+        // TTF paths consult the resolved face's ascent so the visible
+        // baseline sits exactly on the DWG anchor regardless of font.
+        // Stroke paths (SHX) keep the Phase-A calibration — the
+        // Hershey renderer draws from `(draw_x, draw_y)` as the
+        // glyph-box top with its own internal `cap_offset_y`, so
+        // metric-based correction would double-shift those rows. The
+        // metric query is alias-aware: we resolve the entity's STYLE
+        // family through the same alias table the renderer uses for
+        // run dispatch (`alias_font_family`) so e.g. "cityblueprint"
+        // → "Architects Daughter" picks up Architects Daughter's
+        // ascender height, not cityb___.ttf's.
+        float ascent_for_baseline = 0.0f;
+        if (!entity_is_stroke) {
+            std::string_view const fam_raw{t.style.font_family};
+            std::string_view const aliased = alias_font_family(fam_raw);
+            std::string_view const family =
+                aliased.empty() ? fam_raw : aliased;
+            phenotype::FontSpec const outer_spec{
+                family,
+                t.style.bold ? phenotype::FontWeight::Bold
+                             : phenotype::FontWeight::Regular,
+                t.style.italic ? phenotype::FontStyle::Italic
+                               : phenotype::FontStyle::Upright,
+                /*mono=*/false,
+                /*width_factor=*/1.0f,  // vertical metrics ignore wf
+            };
+            auto const m = p.font_metrics(outer_font_px, outer_spec);
+            if (m.ascent > 0.0f) ascent_for_baseline = m.ascent;
+        }
         float top_y = anchor_y;
         switch (t.v_align) {
         case TextVAlign::Baseline:
-        case TextVAlign::Bottom:  top_y = anchor_y - total_height;        break;
+        case TextVAlign::Bottom: {
+            if (ascent_for_baseline > 0.0f) {
+                // phenotype.text(x, y) places the font-box top
+                // (== baseline − ascent) at (x, y). CAD Baseline /
+                // Bottom anchors the bottom-row baseline at
+                // `anchor_y`; the block's font-box top therefore sits
+                // `ascent + (total_height − last_line_advance)` above
+                // the anchor — i.e. one ascent up from the last
+                // baseline, plus every row above it.
+                float const last_line_advance =
+                    line_advances.empty() ? 0.0f : line_advances.back();
+                float const above_last_baseline =
+                    (total_height - last_line_advance)
+                    + ascent_for_baseline;
+                top_y = anchor_y - above_last_baseline;
+            } else {
+                top_y = anchor_y - total_height;
+            }
+            break;
+        }
         case TextVAlign::Middle:  top_y = anchor_y - total_height * 0.5f; break;
         case TextVAlign::Top:     top_y = anchor_y + cap_offset;          break;
         }
