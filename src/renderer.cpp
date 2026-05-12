@@ -18,6 +18,36 @@ namespace {
 constexpr double kHalfPi = 1.57079632679489661923;
 constexpr double kTwoPi  = 6.28318530717958647692;
 
+// Per-render face cache (used inside `render_texts`). Defined at
+// namespace scope so the local C arrays in render_texts hold a
+// well-formed type under module compilation — `import std;` on
+// libc++ trips an `operator new` ambiguity on user-typed STL
+// containers (the same pitfall family the cppx CLAUDE.md flags for
+// `std::map` user-typed values + `std::__hash_memory`). See the
+// face-cache comment in `render_texts` for the discovery logic this
+// supports.
+struct FaceKey {
+    std::string_view      raw_family;     // pre-alias DWG token
+    phenotype::FontWeight weight = phenotype::FontWeight::Regular;
+    phenotype::FontStyle  style  = phenotype::FontStyle::Upright;
+    bool operator==(FaceKey const& o) const {
+        return raw_family == o.raw_family
+            && weight     == o.weight
+            && style      == o.style;
+    }
+};
+
+struct Face {
+    // Family the renderer should pass into phenotype's FontSpec —
+    // either the raw DWG family (host had it) or the alias-resolved
+    // substitute (host didn't, fell back to a bundled OFL face).
+    std::string_view resolved_family;
+    float ascent_per_px     = 0.0f;
+    float descent_per_px    = 0.0f;
+    float cap_height_per_px = 0.0f;
+    bool  valid             = false;
+};
+
 inline phenotype::Color to_paint(Color const& c) {
     return phenotype::Color{c.r, c.g, c.b, c.a};
 }
@@ -493,38 +523,116 @@ void render_arrows(phenotype::Painter& p,
     }
 }
 
-// Resolve a per-run FontSpec, combining the entity's outer Style with
-// the run's optional overrides. Family always passes through the alias
-// table so SHX / Bitstream names resolve to host fonts. The entity-
-// level `width_factor` is propagated onto every run's FontSpec — the
-// macOS backend applies it via the Core Text font matrix so a
-// stretched ATTRIB ("ADDA" with t_wf=6.54 in
-// `blocks_and_tables_-_imperial.dwg`) renders wide along the run's
-// local X axis. MTEXT inline `\W<x>;` codes are deferred and would
-// land as a TextRun per-run override alongside `height_scale`.
-inline phenotype::FontSpec resolve_run_spec(Style const& outer,
-                                            TextRun const& r,
-                                            float entity_width_factor) {
-    std::string_view const fam_raw = r.family_override.empty()
-        ? std::string_view{outer.font_family}
-        : std::string_view{r.family_override};
-    std::string_view const aliased = alias_font_family(fam_raw);
-    std::string_view const family = aliased.empty() ? fam_raw : aliased;
-    bool const bold   = outer.bold   || r.bold_override;
-    bool const italic = outer.italic || r.italic_override;
-    return phenotype::FontSpec{
-        family,
-        bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
-        italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
-        false,
-        entity_width_factor,
-    };
-}
-
 void render_texts(phenotype::Painter& p,
                   Entities const& entities,
                   ViewportTransform const& transform,
                   LayerVisibility const& visibility) {
+    // Per-render face cache backing AutoCAD's font-discovery model:
+    // try the DWG's raw `STYLE.font_family` on the host first; fall
+    // back to the alias table only when the host can't resolve it.
+    // Probes phenotype's `Painter::font_metrics` — `m.ascent > 0` is
+    // the "host has this face" signal (the contract for a missing
+    // face is a zero `FontMetrics{}`). On the macOS backend this
+    // covers system-installed fonts (Times, Arial, …) plus anything
+    // dropped into `~/Library/Fonts/` (e.g. City Blueprint extracted
+    // from MS Office), giving DWG-faithful rendering when the
+    // original font is present without bundling restricted fonts.
+    //
+    // 32-slot C array + linear scan dodges the `import std;` libc++
+    // allocator pitfalls that bit the abandoned cap-height attempt;
+    // N is small (≤ ~10 distinct families per frame). Cache lifetime
+    // is one `render_texts` call — the cost amortises across every
+    // entity that resolves to the same face.
+    //
+    // `CADPP_FONT_FORCE_ALIAS=1` short-circuits the probe and forces
+    // the legacy alias-only path, for users who want pixel-stability
+    // with the bundled OFL set across host installs.
+    constexpr std::size_t kFaceCap = 32;
+    FaceKey     face_keys[kFaceCap]{};
+    Face        face_vals[kFaceCap]{};
+    std::size_t face_count = 0;
+    constexpr float kProbe = 16.0f;
+    bool const force_alias =
+        std::getenv("CADPP_FONT_FORCE_ALIAS") != nullptr;
+
+    auto probe_face = [&](std::string_view family,
+                          phenotype::FontWeight w,
+                          phenotype::FontStyle  s)
+            -> phenotype::FontMetrics {
+        return p.font_metrics(kProbe,
+            phenotype::FontSpec{family, w, s, /*mono=*/false,
+                                /*width_factor=*/1.0f});
+    };
+
+    auto resolve_face = [&](std::string_view raw,
+                            phenotype::FontWeight w,
+                            phenotype::FontStyle  s) -> Face {
+        FaceKey const k{raw, w, s};
+        for (std::size_t i = 0; i < face_count; ++i) {
+            if (face_keys[i] == k) return face_vals[i];
+        }
+        Face f{};
+        f.resolved_family = raw;
+        if (!force_alias) {
+            auto const m = probe_face(raw, w, s);
+            if (m.ascent > 0.0f) {
+                f.resolved_family   = raw;
+                f.ascent_per_px     = m.ascent     / kProbe;
+                f.descent_per_px    = m.descent    / kProbe;
+                f.cap_height_per_px = m.cap_height / kProbe;
+                f.valid             = true;
+            }
+        }
+        if (!f.valid) {
+            std::string_view const aliased = alias_font_family(raw);
+            if (!aliased.empty()) {
+                f.resolved_family = aliased;
+                auto const m = probe_face(aliased, w, s);
+                if (m.ascent > 0.0f) {
+                    f.ascent_per_px     = m.ascent     / kProbe;
+                    f.descent_per_px    = m.descent    / kProbe;
+                    f.cap_height_per_px = m.cap_height / kProbe;
+                    f.valid             = true;
+                }
+            }
+        }
+        if (face_count < kFaceCap) {
+            face_keys[face_count] = k;
+            face_vals[face_count] = f;
+            ++face_count;
+        }
+        return f;
+    };
+
+    // Per-run FontSpec build — combines the entity's outer Style with
+    // the run's optional overrides and routes through the face cache
+    // so the resolved family honours host availability. Entity-level
+    // `width_factor` is propagated onto every run's FontSpec — the
+    // macOS backend applies it via the Core Text font matrix so a
+    // stretched ATTRIB ("ADDA" with t_wf=6.54 in
+    // `blocks_and_tables_-_imperial.dwg`) renders wide along the run's
+    // local X axis. MTEXT inline `\W<x>;` codes are deferred and would
+    // land as a TextRun per-run override alongside `height_scale`.
+    auto resolve_run_spec = [&](Style const& outer,
+                                TextRun const& r,
+                                float entity_width_factor)
+            -> phenotype::FontSpec {
+        std::string_view const fam_raw = r.family_override.empty()
+            ? std::string_view{outer.font_family}
+            : std::string_view{r.family_override};
+        bool const bold   = outer.bold   || r.bold_override;
+        bool const italic = outer.italic || r.italic_override;
+        auto const w = bold   ? phenotype::FontWeight::Bold
+                              : phenotype::FontWeight::Regular;
+        auto const s = italic ? phenotype::FontStyle::Italic
+                              : phenotype::FontStyle::Upright;
+        Face const face = resolve_face(fam_raw, w, s);
+        return phenotype::FontSpec{
+            face.resolved_family, w, s, /*mono=*/false,
+            entity_width_factor,
+        };
+    };
+
     std::size_t cursor = 0;
     for (std::size_t ti = 0; ti < entities.texts.size(); ++ti) {
         process_clip_markers(p, entities.clip_markers, cursor,
@@ -712,18 +820,18 @@ void render_texts(phenotype::Painter& p,
             // no file), and the family token is what
             // `resolve_variant`'s SHX-family table inspects.
             if (t.runs.empty()) {
-                std::string_view const alias =
-                    alias_font_family(t.style.font_family);
-                std::string_view const family =
-                    alias.empty() ? std::string_view{t.style.font_family} : alias;
+                std::string_view const fam_raw{t.style.font_family};
+                auto const w = t.style.bold
+                    ? phenotype::FontWeight::Bold
+                    : phenotype::FontWeight::Regular;
+                auto const s = t.style.italic
+                    ? phenotype::FontStyle::Italic
+                    : phenotype::FontStyle::Upright;
+                Face const face = resolve_face(fam_raw, w, s);
                 hershey::Variant const variant = hershey::resolve_variant(
                     t.style.font_family, t.style.font_file);
                 phenotype::FontSpec const spec{
-                    family,
-                    t.style.bold   ? phenotype::FontWeight::Bold   : phenotype::FontWeight::Regular,
-                    t.style.italic ? phenotype::FontStyle::Italic  : phenotype::FontStyle::Upright,
-                    false,
-                    entity_wf,
+                    face.resolved_family, w, s, /*mono=*/false, entity_wf,
                 };
                 emit_run_text(t.content, outer_font_px, spec,
                               to_paint(t.color), variant);
@@ -935,28 +1043,23 @@ void render_texts(phenotype::Painter& p,
         // Hershey renderer draws from `(draw_x, draw_y)` as the
         // glyph-box top with its own internal `cap_offset_y`, so
         // metric-based correction would double-shift those rows. The
-        // metric query is alias-aware: we resolve the entity's STYLE
-        // family through the same alias table the renderer uses for
-        // run dispatch (`alias_font_family`) so e.g. "cityblueprint"
-        // → "Architects Daughter" picks up Architects Daughter's
-        // ascender height, not cityb___.ttf's.
+        // metric query rides the same per-render face cache the
+        // FontSpec build uses, so the ascent here matches whichever
+        // face the renderer actually drew with (host original if
+        // present, alias substitute otherwise).
         float ascent_for_baseline = 0.0f;
         if (!entity_is_stroke) {
             std::string_view const fam_raw{t.style.font_family};
-            std::string_view const aliased = alias_font_family(fam_raw);
-            std::string_view const family =
-                aliased.empty() ? fam_raw : aliased;
-            phenotype::FontSpec const outer_spec{
-                family,
-                t.style.bold ? phenotype::FontWeight::Bold
-                             : phenotype::FontWeight::Regular,
-                t.style.italic ? phenotype::FontStyle::Italic
-                               : phenotype::FontStyle::Upright,
-                /*mono=*/false,
-                /*width_factor=*/1.0f,  // vertical metrics ignore wf
-            };
-            auto const m = p.font_metrics(outer_font_px, outer_spec);
-            if (m.ascent > 0.0f) ascent_for_baseline = m.ascent;
+            auto const w = t.style.bold
+                ? phenotype::FontWeight::Bold
+                : phenotype::FontWeight::Regular;
+            auto const s = t.style.italic
+                ? phenotype::FontStyle::Italic
+                : phenotype::FontStyle::Upright;
+            Face const face = resolve_face(fam_raw, w, s);
+            if (face.valid) {
+                ascent_for_baseline = face.ascent_per_px * outer_font_px;
+            }
         }
         float top_y = anchor_y;
         switch (t.v_align) {

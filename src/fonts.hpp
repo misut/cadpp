@@ -8,12 +8,23 @@ import std;
 namespace cadpp {
 
 // Map a DWG STYLE family token (already stripped to its bare basename
-// by `extract_family_from_font_file` in parser.cpp) to a font that
-// actually exists on the host. Lookup is case-insensitive over ASCII;
-// punctuation/spaces in the DWG token are ignored. Empty input returns
-// empty; an unknown family returns empty so the caller can fall back to
-// passing the raw DWG family through to phenotype unchanged (the
-// platform backend then logs the missing-font event itself).
+// by `extract_family_from_font_file` in parser.cpp) to a fallback font
+// that actually exists on the host. Lookup is case-insensitive over
+// ASCII; punctuation/spaces in the DWG token are ignored. Empty input
+// returns empty; an unknown family returns empty so the caller can
+// fall back to passing the raw DWG family through to phenotype
+// unchanged.
+//
+// As of issue #48 follow-up, the renderer (`render_texts` in
+// renderer.cpp) treats this table as a **fallback path** — it first
+// probes phenotype's `Painter::font_metrics` for the raw DWG family
+// directly. If the host can resolve the original face (system-
+// installed TTF, e.g. AutoCAD's `cityb___.ttf` from Microsoft Office
+// or any face dropped into `~/Library/Fonts/`), the renderer uses
+// that and skips the alias entirely — matching AutoCAD's font-
+// discovery model. The alias substitute kicks in only when the probe
+// reports a missing face. Set `CADPP_FONT_FORCE_ALIAS=1` to short-
+// circuit the probe and force the legacy alias-only behaviour.
 //
 // Coverage focuses on the AutoCAD-shipped TTF basenames (txt, simplex,
 // romans, isocp...) plus the Bitstream "Swis721 / Dutch801 / Monospac821
