@@ -57,6 +57,7 @@ char const* phenotype_android_startup_message(void);
 
 // cad++ entry — defined in libcadpp.a (src/android_entry.cpp).
 void cadpp_android_set_dwg_path(char const* path);
+void cadpp_android_set_fonts_dir(char const* path);
 void cadpp_android_run(void);
 }
 
@@ -163,6 +164,62 @@ void publish_dwg_path(android_app* app) {
     }
 }
 
+// Stage cad++'s shipped OFL TTFs out of APK assets and into
+// `<internalDataPath>/fonts/`, then publish that directory to libcadpp
+// so `register_bundled_fonts` resolves through
+// `phenotype::native::text::register_font_file`. Filenames mirror
+// `kBundled` in src/fonts.cpp; the gradle `copyCadppFonts` task copies
+// them into the APK at `fonts/<basename>`.
+void publish_bundled_fonts(android_app* app) {
+    char const* internal = app && app->activity
+        ? app->activity->internalDataPath : nullptr;
+    if (internal == nullptr) return;
+
+    static char fonts_dir[PATH_MAX];
+    int n = snprintf(fonts_dir, sizeof(fonts_dir), "%s/fonts", internal);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(fonts_dir)) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG,
+            "internalDataPath too long for fonts dir");
+        return;
+    }
+
+    if (mkdir(fonts_dir, 0755) != 0 && errno != EEXIST) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "mkdir(%s) failed: %s", fonts_dir, strerror(errno));
+        return;
+    }
+
+    // Names must match src/fonts.cpp::kBundled basenames exactly.
+    static constexpr char const* kFontBasenames[] = {
+        "LiberationSerif-Regular.ttf",
+        "ArchitectsDaughter-Regular.ttf",
+        "SourceSans3-Regular.ttf",
+        "JetBrainsMono-Regular.ttf",
+    };
+
+    char asset_path[PATH_MAX];
+    char dest_path[PATH_MAX];
+    unsigned staged = 0;
+    for (char const* name : kFontBasenames) {
+        int an = snprintf(asset_path, sizeof(asset_path),
+                          "fonts/%s", name);
+        int dn = snprintf(dest_path, sizeof(dest_path),
+                          "%s/%s", fonts_dir, name);
+        if (an <= 0 || dn <= 0
+            || static_cast<size_t>(an) >= sizeof(asset_path)
+            || static_cast<size_t>(dn) >= sizeof(dest_path)) {
+            continue;
+        }
+        if (stage_asset_to_path(app, asset_path, dest_path)) ++staged;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+        "bundled fonts staged: %u/%zu under %s",
+        staged, sizeof(kFontBasenames) / sizeof(kFontBasenames[0]),
+        fonts_dir);
+    cadpp_android_set_fonts_dir(fonts_dir);
+}
+
 void handle_cmd(android_app* app, int32_t cmd) {
     switch (cmd) {
     case APP_CMD_INIT_WINDOW:
@@ -216,10 +273,12 @@ extern "C" void android_main(android_app* app) {
             "onFileDialogResult");
     }
 
-    // Order matters: stage the asset and publish its path BEFORE
+    // Order matters: stage assets and publish their paths BEFORE
     // installing the runner, because phenotype invokes the runner from
     // start_app and the runner default-constructs cadpp::State, which
-    // reads g_dwg_path immediately.
+    // reads g_dwg_path and (via State::load) calls register_bundled_fonts
+    // — both need their respective globals populated up front.
+    publish_bundled_fonts(app);
     publish_dwg_path(app);
     phenotype_android_install_runner(&cadpp_android_run);
 

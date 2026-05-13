@@ -69,16 +69,26 @@ unsigned int register_style_fonts(std::span<Style const> styles);
 // system-side copy exists.
 //
 // Probes `<exec>/../../../assets/fonts` (the workspace build layout)
-// and `<exec>/assets/fonts` (a future install layout). Returns the
-// number of files successfully registered (≤ 4); returns 0 with no
-// side effects when the bundle dir cannot be located. Idempotent —
-// phenotype swallows CoreText `kCTFontManagerErrorAlreadyRegistered`
-// (105) so repeated calls from `State::load` are safe.
-//
-// macOS-only resolution for now. Android currently returns 0 because
-// `executable_dir_macos` is gated behind `__APPLE__`; a follow-up
-// phase wires in an asset-manager bridge so the bundled OFL faces
-// reach phenotype on the Android target as well.
+// and `<exec>/assets/fonts` (a future install layout). On Android the
+// bundle dir is supplied out-of-band by the NDK glue via
+// `set_bundled_fonts_dir` — it stages the OFL TTFs out of APK assets
+// into `<internalDataPath>/fonts/` and publishes the path before
+// `State::load` runs. Returns the number of files successfully
+// registered (≤ 4); returns 0 with no side effects when the bundle
+// dir cannot be located. Idempotent — phenotype swallows CoreText
+// `kCTFontManagerErrorAlreadyRegistered` (105) and the Android backend
+// overwrites the existing alias, so repeated calls from `State::load`
+// are safe.
 unsigned int register_bundled_fonts();
+
+// Override the directory `register_bundled_fonts` probes. Used by the
+// Android NDK glue to point cad++ at an APK-staged copy of
+// `assets/fonts/` (inside `internalDataPath`). Passing an empty path
+// clears the override and falls back to the macOS workspace probing.
+//
+// Single-writer: the Android caller sets this once on startup before
+// `State::load` runs, so a plain static slot is sufficient and no
+// locking is required.
+void set_bundled_fonts_dir(std::filesystem::path dir);
 
 } // namespace cadpp

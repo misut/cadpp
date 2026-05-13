@@ -133,6 +133,13 @@ std::string_view alias_font_family(std::string_view dwg_family) noexcept {
 
 namespace {
 
+// Out-of-band override for `locate_bundled_fonts_dir`. The Android
+// NDK glue sets this to `<internalDataPath>/fonts/` after staging the
+// OFL TTFs out of APK assets; everywhere else it stays empty and the
+// macOS workspace probing wins. Single-writer (set on startup before
+// State::load), so no locking.
+std::filesystem::path g_bundled_fonts_override;
+
 // Forward-declare the Darwin-only symbol so we don't drag
 // `<mach-o/dyld.h>` through an `import std;` translation unit. Only
 // reached from `executable_dir_macos`, which is itself behind
@@ -175,6 +182,17 @@ std::filesystem::path executable_dir_macos() {
 // then quietly no-op.
 std::filesystem::path locate_bundled_fonts_dir() {
     namespace fs = std::filesystem;
+    // Out-of-band override wins (Android stages fonts out of APK
+    // assets and sets the path via `set_bundled_fonts_dir`).
+    if (!g_bundled_fonts_override.empty()) {
+        std::error_code ec;
+        if (fs::is_directory(g_bundled_fonts_override, ec)) {
+            auto const canon =
+                fs::canonical(g_bundled_fonts_override, ec);
+            return ec ? g_bundled_fonts_override : canon;
+        }
+        return {};
+    }
     auto const exec = executable_dir_macos();
     if (exec.empty()) return {};
     std::error_code ec;
@@ -361,6 +379,10 @@ unsigned int register_bundled_fonts() {
         }
     }
     return registered;
+}
+
+void set_bundled_fonts_dir(std::filesystem::path dir) {
+    g_bundled_fonts_override = std::move(dir);
 }
 
 } // namespace cadpp

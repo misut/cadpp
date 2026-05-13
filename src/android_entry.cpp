@@ -6,8 +6,10 @@
 // Compiled into `libcadpp.a` only on the Android target. The NDK glue
 // in `android/app/src/main/cpp/cadpp_android_main.cpp` calls
 // `cadpp_android_set_dwg_path` once with a filesystem path that points
-// at the DWG copied out of APK assets, then installs `cadpp_android_run`
-// as the runner phenotype's GameActivity shell will call on first
+// at the DWG copied out of APK assets, similarly stages the bundled
+// OFL fonts and publishes their directory via
+// `cadpp_android_set_fonts_dir`, then installs `cadpp_android_run` as
+// the runner phenotype's GameActivity shell will call on first
 // `APP_CMD_INIT_WINDOW`. From there phenotype drives view/update like
 // it does on the desktop.
 
@@ -18,6 +20,7 @@ import phenotype;
 import phenotype.native.android;
 
 #include "app.hpp"
+#include "fonts.hpp"
 
 extern "C" {
 
@@ -25,6 +28,15 @@ __attribute__((visibility("default")))
 void cadpp_android_set_dwg_path(char const* path) {
     if (path != nullptr && path[0] != '\0') {
         cadpp::g_dwg_path = path;
+    }
+}
+
+__attribute__((visibility("default")))
+void cadpp_android_set_fonts_dir(char const* path) {
+    if (path != nullptr && path[0] != '\0') {
+        cadpp::set_bundled_fonts_dir(std::filesystem::path{path});
+    } else {
+        cadpp::set_bundled_fonts_dir({});
     }
 }
 
