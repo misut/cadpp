@@ -136,7 +136,7 @@ namespace {
 // Forward-declare the Darwin-only symbol so we don't drag
 // `<mach-o/dyld.h>` through an `import std;` translation unit. Only
 // reached from `executable_dir_macos`, which is itself behind
-// `__APPLE__`, so no link impact on Windows / Android builds.
+// `__APPLE__`, so no link impact on the Android build.
 #ifdef __APPLE__
 extern "C" int _NSGetExecutablePath(char* buf, std::uint32_t* size);
 #endif

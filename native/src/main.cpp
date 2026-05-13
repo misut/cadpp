@@ -1,4 +1,4 @@
-// cad++ — desktop entry point (macOS / Windows).
+// cad++ — desktop entry point (macOS debug / preview surface).
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Copyright (C) 2026 misut

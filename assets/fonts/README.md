@@ -61,14 +61,11 @@ substitute.
 
 For AutoCAD-faithful rendering of fonts cad++ can't legally bundle —
 notably **City Blueprint** (`cityb___.ttf`, copyrighted by Payne
-Loving Trust, distributed by Linguist's Software, bundled with
-Microsoft Office) — install the original TTF on the host:
-
-- **macOS**: drop the `.ttf` into `~/Library/Fonts/` (no relogin
-  needed — CoreText picks it up immediately).
-- **Windows**: install via *Settings → Personalization → Fonts*, or
-  rely on Microsoft Office's bundled copy.
-- **Linux**: drop into `~/.local/share/fonts/` and run `fc-cache -f`.
+Loving Trust, distributed by Linguist's Software) — install the
+original TTF on the host. On macOS, drop the `.ttf` into
+`~/Library/Fonts/` (no relogin needed — CoreText picks it up
+immediately). On Android, side-load via the system font installer
+or place the file under `/system/fonts/` on a rooted device.
 
 cad++ will then render the DWG with the actual font (e.g. ADDA /
 CORY B. / BOB M. ATTRIBs in `blocks_and_tables_-_imperial.dwg` fit

@@ -30,9 +30,9 @@ namespace cadpp {
 // romans, isocp...) plus the Bitstream "Swis721 / Dutch801 / Monospac821
 // / Stylus / BankGothic ..." family names that show up inside MTEXT
 // `\f<face>;` switches and in STYLE table font_file fields. Calibrated
-// against fonts that ship with macOS by default; Windows / Android
-// substitutes are tracked in the same table when their macOS choice is
-// also available cross-platform, otherwise left as a TODO.
+// against fonts that ship with macOS by default; the Android target
+// resolves through phenotype's Typeface backend (system + bundled OFL
+// fallback) and inherits the same alias table.
 std::string_view alias_font_family(std::string_view dwg_family) noexcept;
 
 struct Style;  // parser.hpp — forward-declared so this header stays
@@ -75,10 +75,10 @@ unsigned int register_style_fonts(std::span<Style const> styles);
 // phenotype swallows CoreText `kCTFontManagerErrorAlreadyRegistered`
 // (105) so repeated calls from `State::load` are safe.
 //
-// macOS only for Phase B-1. Windows / Android currently return 0
-// because `executable_dir_macos` is gated behind `__APPLE__`; the
-// follow-up phases add per-platform executable-path resolution and an
-// asset-manager bridge respectively.
+// macOS-only resolution for now. Android currently returns 0 because
+// `executable_dir_macos` is gated behind `__APPLE__`; a follow-up
+// phase wires in an asset-manager bridge so the bundled OFL faces
+// reach phenotype on the Android target as well.
 unsigned int register_bundled_fonts();
 
 } // namespace cadpp

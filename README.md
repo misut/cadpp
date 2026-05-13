@@ -8,6 +8,17 @@ entities to a hardware-accelerated canvas.
 The repository is named `cadpp` because GitHub repository names cannot
 contain `+`. The product, binary, and window title are `cad++`.
 
+## Supported platforms
+
+- **Android** (`aarch64-linux-android`, Vulkan via phenotype's Android
+  backend) — production target.
+- **macOS** (`aarch64-apple-darwin`, Metal via phenotype's macOS
+  backend) — debug / preview surface used during development.
+
+Other targets (Windows, Linux desktop, iOS, web) are explicitly out of
+scope. The repository's manifests (`exon.toml`, `native/exon.toml`,
+`test/exon.toml`) only list the two supported `(os, arch)` pairs above.
+
 ## Status
 
 **Pre-alpha — M5 text entities.** Opens a window that loads a

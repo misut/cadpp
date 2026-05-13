@@ -13,7 +13,6 @@ type = "lib"
 standard = 23
 platforms = [
     { os = "macos", arch = "aarch64" },
-    { os = "windows", arch = "x86_64" },
     { os = "android", arch = "aarch64" },
 ]
 
@@ -38,19 +37,6 @@ ENABLE_LTO = "OFF"
 # (exon turns space-separated CMAKE_C_FLAGS into a `;`-separated cmake
 # list; pass the single critical flag here.)
 CMAKE_C_FLAGS = "-D_DARWIN_C_SOURCE"
-
-[target.'cfg(os = "windows")'.dependencies.cmake.libredwg]
-git = "https://github.com/LibreDWG/libredwg.git"
-tag = "0.13.4"
-targets = "libredwg"
-
-[target.'cfg(os = "windows")'.dependencies.cmake.libredwg.options]
-LIBREDWG_LIBONLY = "ON"
-LIBREDWG_DISABLE_WRITE = "ON"
-LIBREDWG_DISABLE_JSON = "ON"
-DISABLE_WERROR = "ON"
-BUILD_SHARED_LIBS = "OFF"
-ENABLE_LTO = "OFF"
 
 [target.'cfg(os = "android")'.dependencies.cmake.libredwg]
 git = "https://github.com/LibreDWG/libredwg.git"
