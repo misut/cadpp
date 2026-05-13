@@ -30,6 +30,32 @@ val copyCadppSamples by tasks.registering(org.gradle.api.tasks.Copy::class) {
     }
 }
 
+// Bundle cad++'s shipped OFL TTFs into the APK under `fonts/`. The
+// NDK glue (`cadpp_android_main.cpp::publish_bundled_fonts`) extracts
+// them from APK assets into `<internalDataPath>/fonts/` at startup so
+// `register_bundled_fonts` resolves through phenotype's Typeface-backed
+// `register_font_file` path. `include("*.ttf")` filters out the OFL
+// `LICENSE.txt` and `README.md` that share `assets/fonts/`.
+val cadppFontsAssetsDir =
+    layout.buildDirectory.dir("generated/cadppFonts/assets")
+val copyCadppFonts by tasks.registering(org.gradle.api.tasks.Copy::class) {
+    val sourceDir = rootProject.file("../assets/fonts")
+    from(sourceDir) {
+        include("*.ttf")
+        into("fonts")
+    }
+    into(cadppFontsAssetsDir)
+    includeEmptyDirs = false
+    doFirst {
+        delete(cadppFontsAssetsDir.get().asFile)
+        if (!sourceDir.isDirectory) {
+            logger.warn(
+                "cadpp fonts: $sourceDir not found; bundled OFL fonts will be absent from APK"
+            )
+        }
+    }
+}
+
 android {
     namespace = "io.github.misut.cadpp"
     compileSdk = 35
@@ -81,6 +107,7 @@ android {
     sourceSets {
         getByName("main") {
             assets.srcDir(generatedCadppSamplesAssets)
+            assets.srcDir(cadppFontsAssetsDir)
         }
     }
 
@@ -109,6 +136,7 @@ android {
 
 tasks.named("preBuild") {
     dependsOn(copyCadppSamples)
+    dependsOn(copyCadppFonts)
 }
 
 dependencies {
